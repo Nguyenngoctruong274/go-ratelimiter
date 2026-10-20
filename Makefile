@@ -22,6 +22,14 @@ test: ## Run unit tests with the race detector
 test-redis: ## Run all tests, including Redis ones (needs `make up`)
 	RL_TEST_REDIS_URL=redis://localhost:6379/15 go test -race -count=1 ./...
 
+.PHONY: fuzz
+fuzz: ## Fuzz the token bucket for 60s
+	go test -run '^$$' -fuzz FuzzTokenBucket -fuzztime 60s ./internal/algo
+
+.PHONY: bench
+bench: ## Run benchmarks
+	go test -run '^$$' -bench . -benchmem ./internal/...
+
 .PHONY: cover
 cover: ## Run tests and print total coverage
 	go test -race -coverprofile=coverage.out ./...

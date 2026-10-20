@@ -35,6 +35,8 @@ jobs:
         run: go test -race -coverpkg=./internal/... -coverprofile=coverage.out ./...
       - name: Coverage
         run: go tool cover -func=coverage.out | tail -1
+      - name: Fuzz (short)
+        run: go test -run '^$' -fuzz FuzzTokenBucket -fuzztime 20s ./internal/algo
 
   lint:
     runs-on: ubuntu-latest
