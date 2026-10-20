@@ -49,10 +49,58 @@ flowchart LR
 | `internal/config` | Environment configuration with validation |
 | `internal/httpapi` | Probes now; check and policy endpoints later |
 | `internal/redisstore` | Redis connection; Lua limiter scripts (day 3+) |
-| `internal/limiter` | `Limiter` interface and `Decision` (day 2) |
-| `internal/algo` | Pure-Go reference algorithms (day 2–4) |
+| `internal/limiter` | `Limit`, `Decision`, the `Limiter` interface, `Clock` |
+| `internal/algo` | Algorithms as pure functions of (state, limit, now, cost): the reference for the Lua scripts |
+| `internal/memory` | Single-process limiter: reference, Redis fallback, or enough for one replica |
 | `internal/middleware` | `net/http` middleware (day 5) |
 | `internal/policy` | Rules and tiers with hot reload (day 6) |
+
+## Token bucket
+
+A `Limit{Rate, Period, Burst}` allows `Rate` events per `Period` on average
+and bursts of up to `Burst` after a quiet period. Each check returns a
+`Decision` with `Allowed`, `Remaining`, `RetryAfter` and `ResetAfter`.
+
+```go
+lim := memory.New(limiter.SystemClock{})
+d, err := lim.Allow(ctx, "user:42", limiter.PerSecond(5, 10), 1)
+if !d.Allowed {
+    // respond 429 with Retry-After: d.RetryAfter
+}
+```
+
+How it stays exact:
+
+- **Integer state, no floats.** The level is stored in *token-microseconds*
+  (tokens × period in µs). Refilling `Rate` tokens per `Period` then adds
+  exactly `Rate` per elapsed microsecond, so a limit of 1/minute or
+  100,000/second loses nothing to rounding.
+- **Lua-safe range.** `Limit.Validate` keeps `Burst × Period(µs) + Rate`
+  below 2^53, the largest range a float64 (Lua's only number type) holds
+  exactly. The Redis script (day 3) can therefore produce the same decisions
+  as the Go code, and the tests will compare them.
+- **Denials are free and promises are exact.** A denied request consumes
+  nothing, and retrying after `RetryAfter` succeeds, but not one
+  microsecond earlier. The fuzz test checks this on every denial.
+- **Clock skew can't mint tokens.** If an instance with a lagging clock
+  updates a bucket, it does not refill until its clock passes the last
+  stamp, and its `RetryAfter` includes that lag.
+- **State per (key, limit).** Changing a key's limit starts a fresh bucket
+  instead of misreading a level kept in another limit's units.
+- **Bounded memory.** Full buckets equal missing ones, so `Sweep` drops them
+  and memory tracks keys that were active within one refill period.
+
+`FuzzTokenBucket` drives random limits, costs and clock jumps (including
+backwards) and checks that the level stays in `[0, burst]`, that tokens
+granted never exceed `burst + rate × elapsed`, that `RetryAfter` and
+`ResetAfter` are exact, and that `Remaining` matches the level. It runs
+for 20s in CI; `make fuzz` runs it for a minute.
+
+| Benchmark (2 vCPU) | ns/op | allocs |
+|---|---|---|
+| `algo.TokenBucket` (pure step) | 20 | 0 |
+| `memory.Allow`, 1,024 keys, serial | 163 | 0 |
+| `memory.Allow`, 1,024 keys, parallel | 204 | 0 |
 
 ## Quick start
 
@@ -91,7 +139,7 @@ path of its callers, so a slow Redis must become a fast error.
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with Redis, CI
-- [ ] **Day 2**: Token bucket, in-memory, with a fake clock, table tests and fuzzing
+- [x] **Day 2**: Token bucket, in-memory, with a fake clock, table tests and fuzzing
 - [ ] **Day 3**: Token bucket on Redis via Lua; equivalence tests against the Go version on real Redis
 - [ ] **Day 4**: Sliding window and GCRA (Redis + Go); accuracy comparison
 - [ ] **Day 5**: HTTP middleware: key extraction (IP, header, user), `RateLimit-*` headers, `Retry-After`
