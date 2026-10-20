@@ -1,0 +1,24 @@
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  ratelimitd:
+    profiles: ["stack"]
+    build: .
+    environment:
+      RL_REDIS_URL: redis://redis:6379/0
+      RL_LOG_LEVEL: info
+      RL_SHUTDOWN_DRAIN: 2s
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
