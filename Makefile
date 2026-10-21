@@ -28,6 +28,10 @@ fuzz: ## Fuzz each algorithm for 60s
 		go test -run '^$$' -fuzz "^$$f$$" -fuzztime 60s ./internal/algo || exit 1; \
 	done
 
+.PHONY: compare
+compare: ## Print the accuracy comparison of the algorithms
+	go test -count=1 -run TestAccuracyComparison -v ./internal/algo
+
 .PHONY: bench
 bench: ## Run benchmarks
 	go test -run '^$$' -bench . -benchmem ./internal/...

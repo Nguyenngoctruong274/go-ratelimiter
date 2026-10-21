@@ -22,9 +22,10 @@ questions this project answers with code and tests:
   races. Each algorithm runs as a single Lua script in Redis.
 - **Clocks**: instances disagree about the time. The scripts use Redis `TIME`
   as the single clock.
-- **Choice of algorithm**: token bucket (bursts), sliding window (strict),
-  and GCRA (one key, smooth). Each has a pure-Go reference implementation
-  that the Redis version is tested against.
+- **Choice of algorithm**: token bucket (bursts), GCRA (the same decisions
+  from one timestamp) and sliding window (per-window quotas), with a
+  measured [accuracy comparison](#accuracy-comparison). Each has a pure-Go
+  reference implementation that the Redis version is tested against.
 - **Failure**: when Redis is slow or down, does the caller fail open or
   closed? It has to be a decision, made quickly, not a hung request.
 - **Contract**: standard `RateLimit-*` / `Retry-After` headers so clients can
@@ -48,10 +49,10 @@ flowchart LR
 | `cmd/ratelimitd` | Service wiring, graceful shutdown |
 | `internal/config` | Environment configuration with validation |
 | `internal/httpapi` | Probes now; check and policy endpoints later |
-| `internal/redisstore` | Redis connection; limiters as atomic Lua scripts sharing state across instances |
+| `internal/redisstore` | Redis connection; token bucket, GCRA and sliding window as atomic Lua scripts sharing state across instances |
 | `internal/limiter` | `Limit`, `Decision`, the `Limiter` interface, `Clock` |
-| `internal/algo` | Algorithms as pure functions of (state, limit, now, cost): the reference for the Lua scripts |
-| `internal/memory` | Single-process limiter: reference, Redis fallback, or enough for one replica |
+| `internal/algo` | Token bucket, GCRA and sliding window as pure functions of (state, limit, now, cost): the reference for the Lua scripts |
+| `internal/memory` | Single-process token-bucket limiter: Redis fallback, or enough for one replica |
 | `internal/middleware` | `net/http` middleware (day 5) |
 | `internal/policy` | Rules and tiers with hot reload (day 6) |
 
@@ -94,7 +95,7 @@ How it stays exact:
 backwards) and checks that the level stays in `[0, burst]`, that tokens
 granted never exceed `burst + rate × elapsed`, that `RetryAfter` and
 `ResetAfter` are exact, and that `Remaining` matches the level. It runs
-for 20s in CI; `make fuzz` runs it for a minute.
+in CI on every push (see below).
 
 | Benchmark (2 vCPU) | ns/op | allocs |
 |---|---|---|
@@ -102,51 +103,161 @@ for 20s in CI; `make fuzz` runs it for a minute.
 | `memory.Allow`, 1,024 keys, serial | 163 | 0 |
 | `memory.Allow`, 1,024 keys, parallel | 204 | 0 |
 
-## Token bucket on Redis
+## GCRA
 
-`redisstore.TokenBucket` implements the same `limiter.Limiter` with state in
+The generic cell rate algorithm is a token bucket described by one number:
+the *theoretical arrival time* (TAT), the moment the key is back to its
+full burst. A request of cost `n` pushes the TAT `n × Period/Rate` further
+out and is granted if that keeps it within `Burst × Period/Rate` of now.
+
+- **Same decisions as the token bucket.** The debt `(TAT − now) × Rate` is
+  exactly the bucket's missing level, so on a monotonic clock GCRA and the
+  token bucket decide identically. `TestGCRAMatchesTokenBucket` checks it
+  call by call over 55 limits and 110,000 calls.
+- **Only grants write.** A denial or a peek reads the TAT and changes
+  nothing. Under attack, an exhausted key costs Redis no writes, no
+  replication and no AOF traffic for the requests it turns away; the token
+  bucket rewrites its stamp on every check.
+- **Exact fractions.** `Period/Rate` is rarely whole microseconds (3 per
+  7ms is 2333⅓µs). Rounding it would admit requests early or late, so the
+  TAT is stored as `micros + frac/Rate`, as the string `"<micros>:<frac>"`.
+- **Bounded horizon.** The TAT lies up to `Burst × Period/Rate` ahead, so
+  `algo.CheckGCRA` caps that at 2^52µs (about 142 years). Unix time in µs
+  stays below 2^52 until 2112, keeping the TAT exact in Lua.
+- **Skew.** A clock behind the writer's sees more debt, so it can only be
+  stricter.
+
+## Sliding window
+
+The sliding-window counter keeps two counts per key instead of a log of
+every event. Time is cut into fixed windows of `span = ⌈Burst × Period/Rate⌉`
+(the time `Burst` events take at the average rate, so a `Limit` means the
+same thing for all three algorithms). The count over the sliding window
+ending now is estimated as
+
+```
+used = prev × (span − offset) / span + curr
+```
+
+and a request is granted if `used + n ≤ Burst`. Everything is computed
+multiplied by `span`, in integers, so the estimate is exact; `WindowSpan`
+rejects limits where `Burst × span` would pass 2^53.
+
+The model is not exact: it assumes the previous window's events were spread
+evenly. When they were bunched at its end, the true count over a sliding
+window can exceed `Burst`; when they came early, it denies requests the
+exact rule would allow. `RetryAfter` is still exact for the estimate (the
+fuzz test checks it to the microsecond), and no fixed window ever holds
+more than `Burst`.
+
+## Accuracy comparison
+
+`make compare` replays one minute of traffic through all three algorithms
+and an exact sliding log (which remembers every event, so its memory grows
+with the burst), all with `PerSecond(10, 10)`, and checks each one against
+the rule "at most 10 events in any 1s". Each algorithm is judged on its own
+history: **Over** counts grants made although 10 had already been granted in
+the last second, **Under** counts denials although there was room.
+
+| Traffic | Algorithm | Allowed | Over | Under | Peak in any 1s |
+|---|---|---|---|---|---|
+| steady 20/s | sliding log (exact) | 600 | 0 | 0 | 10 |
+| | sliding window | 541 | 0 | 648 | 10 |
+| | token bucket | 609 | 18 | 0 | 19 |
+| | GCRA | 609 | 18 | 0 | 19 |
+| 20 requests in the last 100ms of every second | sliding log (exact) | 600 | 0 | 0 | 10 |
+| | sliding window | 541 | 0 | 649 | 10 |
+| | token bucket | 600 | 0 | 0 | 10 |
+| | GCRA | 600 | 0 | 0 | 10 |
+| random ~10/s with retry storms | sliding log (exact) | 476 | 0 | 0 | 10 |
+| | sliding window | 470 | 42 | 348 | 12 |
+| | token bucket | 595 | 284 | 0 | 19 |
+| | GCRA | 595 | 284 | 0 | 19 |
+
+What it shows:
+
+- **Token bucket and GCRA are identical** on every request (the test fails
+  if they ever differ). They never deny while the average allows it, and
+  by design they let up to `2 × Burst` through in one window: a full bucket
+  plus a window's worth of refill.
+- **The sliding window stays close to the window rule but errs both ways.**
+  It mostly under-admits: with steady overload its estimate still counts
+  last window's early events after they have left the window, so it allows
+  541 where the exact rule allows 600. Under bursty traffic it also
+  over-admits, reaching 12 in one second.
+- **Choosing.** Use GCRA (or the token bucket) when clients should get a
+  burst after a quiet period and the long-run rate is what matters; on
+  Redis prefer GCRA, since denials do not write. Use the sliding window
+  when the contract is "N per window" (API quotas) and a small error is
+  acceptable. A guarantee of "never more than N in any window" needs the
+  exact log: a sorted set with one member per event, O(Burst) memory per
+  key, which this project leaves out on purpose.
+
+| Benchmark (Apple M2), pure step | ns/op | allocs |
+|---|---|---|
+| `algo.TokenBucket` | 7.8 | 0 |
+| `algo.GCRA` | 8.9 | 0 |
+| `algo.SlidingWindow` | 13.8 | 0 |
+
+`FuzzGCRA` and `FuzzSlidingWindow` check the same kind of invariants as
+`FuzzTokenBucket` (exact `RetryAfter` and `ResetAfter`, a ceiling on what is
+granted, denials leave the state untouched) with backward clock jumps. CI
+fuzzes each for 15s; `make fuzz` runs each for a minute.
+
+## On Redis
+
+`redisstore` implements each algorithm as a `limiter.Limiter` with state in
 Redis, so every instance that shares the server enforces one limit.
 
 ```go
 rdb, _ := redisstore.Open(ctx, "redis://localhost:6379/0")
-lim := redisstore.NewTokenBucket(rdb, "")   // keys under "rl:"
+lim := redisstore.NewGCRA(rdb, "")   // or NewTokenBucket, NewSlidingWindow; keys under "rl:"
 d, err := lim.Allow(ctx, "user:42", limiter.PerSecond(5, 10), 1)
 ```
 
-- **One round trip, atomic.** Each check is one `EVALSHA` of
-  [`tokenbucket.lua`](internal/redisstore/tokenbucket.lua), a line-by-line
-  port of `algo.TokenBucket`. Redis runs a script to completion before the
-  next one, so no two instances can spend the same token. go-redis falls
-  back to `EVAL` when the script cache is empty (restart, failover).
-- **One clock.** The script reads `TIME` on the Redis server, so instances
-  with skewed clocks still agree on how many tokens a bucket has.
-- **Exact in Lua.** All values stay below 2^53 and the script never formats
+- **One round trip, atomic.** Each check is one `EVALSHA` of a Lua script
+  ([`tokenbucket.lua`](internal/redisstore/tokenbucket.lua),
+  [`gcra.lua`](internal/redisstore/gcra.lua),
+  [`slidingwindow.lua`](internal/redisstore/slidingwindow.lua)), a
+  line-by-line port of the Go reference in `algo`. Redis runs a script to
+  completion before the next one, so no two instances can spend the same
+  token. go-redis falls back to `EVAL` when the script cache is empty
+  (restart, failover).
+- **One clock.** The scripts read `TIME` on the Redis server, so instances
+  with skewed clocks still agree on the state of a key.
+- **Exact in Lua.** All values stay below 2^53 and the scripts never format
   numbers with `tostring` (14 significant digits, which would corrupt
   microsecond stamps). Integer division with `math.floor(a / b)` is
-  provably exact in that range; the comment in the script has the proof and
-  `TestFloat64FloorDivIsExact` checks it on the boundary cases.
-- **Self-cleaning.** Key: `rl:tb:<rate>:<period µs>:<burst>:<key>`, a hash of
-  `{l: level, s: stamp}`. It gets a `PEXPIRE` of exactly the time until the
-  bucket would be full, and is deleted outright when full, so idle keys cost
-  nothing and need no sweeper.
+  provably exact in that range; the comment in `tokenbucket.lua` has the
+  proof and `TestFloat64FloorDivIsExact` checks it on the boundary cases.
+  Each algorithm rejects limits that would leave that range
+  (`Limit.Validate`, `algo.CheckGCRA`, `algo.WindowSpan`) before calling
+  Redis.
+- **Self-cleaning.** Keys are `rl:<tb|gcra|sw>:<rate>:<period µs>:<burst>:<key>`.
+  Each gets a `PEXPIRE` of exactly the time until the full burst is back,
+  and is deleted outright once it is, so idle keys cost nothing and need no
+  sweeper.
 
-How it is tested, against a real Redis 7 (CI runs a Redis service):
+How it is tested, against a real Redis 7 (CI runs a Redis service). Every
+test runs for all three scripts:
 
 | Test | What it proves |
 |---|---|
-| `TestTokenBucketMatchesReference` | 39 limits (including the 2^53 extremes) × 80 random calls with clock jumps both ways: every Lua decision **and** the stored state equal the Go reference |
-| `TestTokenBucketIsAtomicAcrossInstances` | 5 instances (separate pools) × 40 goroutines on one key: exactly `Burst` of 1,000 allowed |
-| `TestTokenBucketUsesRedisClockAndExpires` | Waits and TTL are measured on the server clock |
-| `TestTokenBucketStateExpires` | State disappears once the bucket refills, and the key gets its full burst back |
-| `TestTokenBucketReloadsFlushedScript` | Survives `SCRIPT FLUSH` |
-| `TestTokenBucketErrors` | Bad input never reaches Redis; a Redis failure is an error, never a silent allow |
+| `TestScriptsMatchReference` | Up to 41 limits (including each algorithm's extremes; each skips the ones it rejects) × 80 random calls with clock jumps both ways: every Lua decision **and** the stored state equal the Go reference |
+| `TestScriptsAreAtomicAcrossInstances` | 5 instances (separate pools) × 40 goroutines on one key: exactly `Burst` of 1,000 allowed |
+| `TestScriptsUseRedisClockAndExpire` | Waits are measured on the server clock; the key's TTL equals `ResetAfter` |
+| `TestScriptsStateExpires` | State disappears once the burst is back, and the key gets its full burst again |
+| `TestGCRADenialsDoNotWrite` | An exhausted GCRA key keeps its value and TTL while requests are denied |
+| `TestScriptsReloadAfterFlush` | Survives `SCRIPT FLUSH` |
+| `TestScriptErrors` | Bad input never reaches Redis; a Redis failure is an error, never a silent allow |
 
-Breaking the script on purpose (for example, saving state with `tostring`)
-fails the reference test on its first call.
+Breaking a script on purpose (saving state with `tostring`, an off-by-one in
+a wait, ignoring the clock lag, a `>` for a `>=`) fails the reference test.
 
-Measured against a local Redis 7 on the same 2 vCPU machine, one `Allow`
-takes about 50 µs serially and 42 µs per call in parallel, which is almost
-all network round trip. Day 9 works on fewer round trips.
+All three cost the same: one round trip and about 80 bytes per active key.
+Against a local Redis 7 on an Apple M2 laptop, one `Allow` takes about
+164 µs serially and 46 µs per call with 8 goroutines, for every algorithm,
+which is almost all network round trip. Day 9 works on fewer round trips.
 
 ## Quick start
 
@@ -187,7 +298,7 @@ path of its callers, so a slow Redis must become a fast error.
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with Redis, CI
 - [x] **Day 2**: Token bucket, in-memory, with a fake clock, table tests and fuzzing
 - [x] **Day 3**: Token bucket on Redis via Lua; equivalence tests against the Go version on real Redis
-- [ ] **Day 4**: Sliding window and GCRA (Redis + Go); accuracy comparison
+- [x] **Day 4**: Sliding window and GCRA (Redis + Go); accuracy comparison
 - [ ] **Day 5**: HTTP middleware: key extraction (IP, header, user), `RateLimit-*` headers, `Retry-After`
 - [ ] **Day 6**: Policy engine: multiple rules, tiers, file-based config with hot reload
 - [ ] **Day 7**: Failure handling: fail-open / fail-closed, circuit breaker, local fallback
