@@ -48,7 +48,7 @@ flowchart LR
 | `cmd/ratelimitd` | Service wiring, graceful shutdown |
 | `internal/config` | Environment configuration with validation |
 | `internal/httpapi` | Probes now; check and policy endpoints later |
-| `internal/redisstore` | Redis connection; Lua limiter scripts (day 3+) |
+| `internal/redisstore` | Redis connection; limiters as atomic Lua scripts sharing state across instances |
 | `internal/limiter` | `Limit`, `Decision`, the `Limiter` interface, `Clock` |
 | `internal/algo` | Algorithms as pure functions of (state, limit, now, cost): the reference for the Lua scripts |
 | `internal/memory` | Single-process limiter: reference, Redis fallback, or enough for one replica |
@@ -77,8 +77,8 @@ How it stays exact:
   100,000/second loses nothing to rounding.
 - **Lua-safe range.** `Limit.Validate` keeps `Burst × Period(µs) + Rate`
   below 2^53, the largest range a float64 (Lua's only number type) holds
-  exactly. The Redis script (day 3) can therefore produce the same decisions
-  as the Go code, and the tests will compare them.
+  exactly. The Redis script therefore produces the same decisions as the Go
+  code, and the tests compare them call by call.
 - **Denials are free and promises are exact.** A denied request consumes
   nothing, and retrying after `RetryAfter` succeeds, but not one
   microsecond earlier. The fuzz test checks this on every denial.
@@ -101,6 +101,52 @@ for 20s in CI; `make fuzz` runs it for a minute.
 | `algo.TokenBucket` (pure step) | 20 | 0 |
 | `memory.Allow`, 1,024 keys, serial | 163 | 0 |
 | `memory.Allow`, 1,024 keys, parallel | 204 | 0 |
+
+## Token bucket on Redis
+
+`redisstore.TokenBucket` implements the same `limiter.Limiter` with state in
+Redis, so every instance that shares the server enforces one limit.
+
+```go
+rdb, _ := redisstore.Open(ctx, "redis://localhost:6379/0")
+lim := redisstore.NewTokenBucket(rdb, "")   // keys under "rl:"
+d, err := lim.Allow(ctx, "user:42", limiter.PerSecond(5, 10), 1)
+```
+
+- **One round trip, atomic.** Each check is one `EVALSHA` of
+  [`tokenbucket.lua`](internal/redisstore/tokenbucket.lua), a line-by-line
+  port of `algo.TokenBucket`. Redis runs a script to completion before the
+  next one, so no two instances can spend the same token. go-redis falls
+  back to `EVAL` when the script cache is empty (restart, failover).
+- **One clock.** The script reads `TIME` on the Redis server, so instances
+  with skewed clocks still agree on how many tokens a bucket has.
+- **Exact in Lua.** All values stay below 2^53 and the script never formats
+  numbers with `tostring` (14 significant digits, which would corrupt
+  microsecond stamps). Integer division with `math.floor(a / b)` is
+  provably exact in that range; the comment in the script has the proof and
+  `TestFloat64FloorDivIsExact` checks it on the boundary cases.
+- **Self-cleaning.** Key: `rl:tb:<rate>:<period µs>:<burst>:<key>`, a hash of
+  `{l: level, s: stamp}`. It gets a `PEXPIRE` of exactly the time until the
+  bucket would be full, and is deleted outright when full, so idle keys cost
+  nothing and need no sweeper.
+
+How it is tested, against a real Redis 7 (CI runs a Redis service):
+
+| Test | What it proves |
+|---|---|
+| `TestTokenBucketMatchesReference` | 39 limits (including the 2^53 extremes) × 80 random calls with clock jumps both ways: every Lua decision **and** the stored state equal the Go reference |
+| `TestTokenBucketIsAtomicAcrossInstances` | 5 instances (separate pools) × 40 goroutines on one key: exactly `Burst` of 1,000 allowed |
+| `TestTokenBucketUsesRedisClockAndExpires` | Waits and TTL are measured on the server clock |
+| `TestTokenBucketStateExpires` | State disappears once the bucket refills, and the key gets its full burst back |
+| `TestTokenBucketReloadsFlushedScript` | Survives `SCRIPT FLUSH` |
+| `TestTokenBucketErrors` | Bad input never reaches Redis; a Redis failure is an error, never a silent allow |
+
+Breaking the script on purpose (for example, saving state with `tostring`)
+fails the reference test on its first call.
+
+Measured against a local Redis 7 on the same 2 vCPU machine, one `Allow`
+takes about 50 µs serially and 42 µs per call in parallel, which is almost
+all network round trip. Day 9 works on fewer round trips.
 
 ## Quick start
 
@@ -140,7 +186,7 @@ path of its callers, so a slow Redis must become a fast error.
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with Redis, CI
 - [x] **Day 2**: Token bucket, in-memory, with a fake clock, table tests and fuzzing
-- [ ] **Day 3**: Token bucket on Redis via Lua; equivalence tests against the Go version on real Redis
+- [x] **Day 3**: Token bucket on Redis via Lua; equivalence tests against the Go version on real Redis
 - [ ] **Day 4**: Sliding window and GCRA (Redis + Go); accuracy comparison
 - [ ] **Day 5**: HTTP middleware: key extraction (IP, header, user), `RateLimit-*` headers, `Retry-After`
 - [ ] **Day 6**: Policy engine: multiple rules, tiers, file-based config with hot reload
