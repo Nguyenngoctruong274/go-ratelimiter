@@ -23,8 +23,10 @@ test-redis: ## Run all tests, including Redis ones (needs `make up`)
 	RL_TEST_REDIS_URL=redis://localhost:6379/15 go test -race -count=1 ./...
 
 .PHONY: fuzz
-fuzz: ## Fuzz the token bucket for 60s
-	go test -run '^$$' -fuzz FuzzTokenBucket -fuzztime 60s ./internal/algo
+fuzz: ## Fuzz each algorithm for 60s
+	for f in FuzzTokenBucket FuzzGCRA FuzzSlidingWindow; do \
+		go test -run '^$$' -fuzz "^$$f$$" -fuzztime 60s ./internal/algo || exit 1; \
+	done
 
 .PHONY: bench
 bench: ## Run benchmarks

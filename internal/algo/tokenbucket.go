@@ -5,7 +5,6 @@
 package algo
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/Nguyenngoctruong274/go-ratelimiter/internal/limiter"
@@ -33,11 +32,8 @@ type Bucket struct {
 // not refilled until time catches up, so skew can delay tokens but never
 // mint extra ones.
 func TokenBucket(b Bucket, found bool, l limiter.Limit, now, n int64) (Bucket, limiter.Decision, error) {
-	if err := l.Validate(); err != nil {
+	if err := l.Check(n); err != nil {
 		return b, limiter.Decision{}, err
-	}
-	if n < 0 || n > l.Burst {
-		return b, limiter.Decision{}, fmt.Errorf("%w: cost %d with burst %d", limiter.ErrInvalidCost, n, l.Burst)
 	}
 
 	per := l.PeriodMicros()

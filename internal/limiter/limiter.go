@@ -64,6 +64,19 @@ func (l Limit) Validate() error {
 	return nil
 }
 
+// Check validates l together with a cost n. A cost is valid when
+// 0 <= n <= Burst: a larger one could never be granted, however long the
+// caller waited.
+func (l Limit) Check(n int64) error {
+	if err := l.Validate(); err != nil {
+		return err
+	}
+	if n < 0 || n > l.Burst {
+		return fmt.Errorf("%w: cost %d with burst %d", ErrInvalidCost, n, l.Burst)
+	}
+	return nil
+}
+
 func (l Limit) String() string {
 	return fmt.Sprintf("%d/%s burst %d", l.Rate, l.Period, l.Burst)
 }

@@ -40,6 +40,29 @@ func TestLimitValidate(t *testing.T) {
 	}
 }
 
+func TestLimitCheck(t *testing.T) {
+	l := PerSecond(5, 10)
+	tests := []struct {
+		name  string
+		limit Limit
+		n     int64
+		want  error
+	}{
+		{"peek", l, 0, nil},
+		{"whole burst", l, 10, nil},
+		{"negative cost", l, -1, ErrInvalidCost},
+		{"cost above burst can never succeed", l, 11, ErrInvalidCost},
+		{"invalid limit is reported first", Limit{}, 11, ErrInvalidLimit},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.limit.Check(tt.n); !errors.Is(err, tt.want) || (tt.want == nil) != (err == nil) {
+				t.Fatalf("Check(%d) = %v, want %v", tt.n, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestLimitString(t *testing.T) {
 	if got := PerSecond(5, 10).String(); got != "5/1s burst 10" {
 		t.Fatalf("String() = %q", got)

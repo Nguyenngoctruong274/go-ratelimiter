@@ -1,0 +1,5 @@
+go test fuzz v1
+int64(179)
+int64(7000)
+int64(2)
+[]byte("00\xff201")

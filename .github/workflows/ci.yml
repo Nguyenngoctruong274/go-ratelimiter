@@ -36,7 +36,10 @@ jobs:
       - name: Coverage
         run: go tool cover -func=coverage.out | tail -1
       - name: Fuzz (short)
-        run: go test -run '^$' -fuzz FuzzTokenBucket -fuzztime 20s ./internal/algo
+        run: |
+          for f in FuzzTokenBucket FuzzGCRA FuzzSlidingWindow; do
+            go test -run '^$' -fuzz "^$f\$" -fuzztime 15s ./internal/algo
+          done
 
   lint:
     runs-on: ubuntu-latest
