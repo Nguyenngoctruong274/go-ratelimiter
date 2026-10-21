@@ -1,6 +1,7 @@
 // Package redisstore keeps rate-limiter state in Redis so every instance of
-// the service shares the same counters. The limiter scripts arrive in later
-// steps; this file owns the connection.
+// the service shares the same counters. Each limiter (TokenBucket, GCRA,
+// SlidingWindow) runs every check as one atomic Lua script, a port of its
+// reference in package algo; this file owns the connection.
 package redisstore
 
 import (
