@@ -1,5 +1,3 @@
-// Package middleware rate-limits net/http handlers. This file decides who a
-// request belongs to.
 package middleware
 
 import (

@@ -53,7 +53,7 @@ flowchart LR
 | `internal/limiter` | `Limit`, `Decision`, the `Limiter` interface, `Clock` |
 | `internal/algo` | Token bucket, GCRA and sliding window as pure functions of (state, limit, now, cost): the reference for the Lua scripts |
 | `internal/memory` | Single-process token-bucket limiter: Redis fallback, or enough for one replica |
-| `internal/middleware` | `net/http` middleware (day 5) |
+| `internal/middleware` | `net/http` middleware: client keys (IP, API key, user), `RateLimit` headers, 429 + `Retry-After` |
 | `internal/policy` | Rules and tiers with hot reload (day 6) |
 
 ## Token bucket
@@ -259,6 +259,74 @@ Against a local Redis 7 on an Apple M2 laptop, one `Allow` takes about
 164 µs serially and 46 µs per call with 8 goroutines, for every algorithm,
 which is almost all network round trip. Day 9 works on fewer round trips.
 
+## HTTP middleware
+
+```go
+ip, _ := middleware.ByIP(middleware.IPOptions{
+    TrustedProxies: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, // your load balancers
+})
+limit, err := middleware.New(middleware.Options{
+    Limiter: redisstore.NewTokenBucket(rdb, ""),          // or GCRA, SlidingWindow, memory.New
+    Limit:   limiter.PerSecond(5, 10),
+    Key:     middleware.FirstOf(middleware.ByHeader("X-API-Key"), ip),
+    Policy:  "api",
+})
+http.ListenAndServe(":8080", limit(mux))
+```
+
+A runnable version is in [`examples/http-middleware`](examples/http-middleware/main.go).
+
+**Responses.** Every checked request gets the fields of the IETF draft
+[RateLimit header fields for HTTP](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/):
+
+```http
+HTTP/1.1 429 Too Many Requests
+RateLimit-Policy: "api";q=5;w=1
+RateLimit: "api";r=0;t=2
+Retry-After: 1
+Content-Type: application/json
+
+{"error":{"code":"rate_limited","message":"rate limit exceeded","retry_after_ms":200}}
+```
+
+`q`/`w` are the quota per window, `r` the remaining quota, `t` the seconds
+until it is fully restored. `Retry-After` is rounded **up** to whole
+seconds so a client that obeys it is never refused for being early;
+`retry_after_ms` gives the precise wait. `LegacyHeaders: true` adds the
+widely used `X-RateLimit-Limit/-Remaining/-Reset`. For sub-second periods
+the advertised quota is scaled to one second and rounded down, so it is
+never more generous than the real limit.
+
+**Who is the client?**
+
+| KeyFunc | Key | Notes |
+|---|---|---|
+| `ByIP` | `ip:203.0.113.7`, `ip:2001:db8:1:2::/64` | IPv6 grouped by /64 (configurable): one subscriber usually owns a whole /64 and could rotate addresses |
+| `ByHeader("X-API-Key")` | `h:x-api-key:<sha256 prefix>` | The credential is hashed before it reaches Redis or logs |
+| `ByUser(fn)` | `u:<id>` | For ids set by your auth middleware |
+| `FirstOf(a, b, …)` | first one found | e.g. API key, else IP |
+
+`X-Forwarded-For` is read **from the right**, and only past hops added by
+`TrustedProxies`. The common "take the leftmost address" approach lets any
+client pick its own key by sending the header; a test feeds exactly that
+spoof and checks it is ignored.
+
+**When things go wrong.**
+
+| Situation | Response |
+|---|---|
+| Limiter error (Redis down) | `503` with `Retry-After: 1`, or pass through with `FailOpen: true` |
+| Limit out of range for the algorithm | `500`; a config bug is never "failed open" |
+| `Cost` above the burst | `400`: no amount of waiting would help |
+| No key found | `400` |
+
+Each `Policy` gets its own key namespace, so `search` and `upload` limits
+never share state. `TestReplicasShareOneLimitThroughRedis` runs three
+replicas of an API, each with its own middleware and connection pool,
+behind a simulated load balancer: 90 concurrent requests from one client,
+exactly 20 (the burst) pass. With the in-memory limiter the middleware adds
+about 1.7 µs per request (`BenchmarkMiddleware`, including the recorder).
+
 ## Quick start
 
 ```bash
@@ -299,7 +367,7 @@ path of its callers, so a slow Redis must become a fast error.
 - [x] **Day 2**: Token bucket, in-memory, with a fake clock, table tests and fuzzing
 - [x] **Day 3**: Token bucket on Redis via Lua; equivalence tests against the Go version on real Redis
 - [x] **Day 4**: Sliding window and GCRA (Redis + Go); accuracy comparison
-- [ ] **Day 5**: HTTP middleware: key extraction (IP, header, user), `RateLimit-*` headers, `Retry-After`
+- [x] **Day 5**: HTTP middleware: key extraction (IP, header, user), `RateLimit-*` headers, `Retry-After`
 - [ ] **Day 6**: Policy engine: multiple rules, tiers, file-based config with hot reload
 - [ ] **Day 7**: Failure handling: fail-open / fail-closed, circuit breaker, local fallback
 - [ ] **Day 8**: Service mode: `POST /v1/check`; multi-instance integration tests on shared Redis
