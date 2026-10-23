@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Nguyenngoctruong274/go-ratelimiter/internal/limiter"
@@ -66,77 +67,136 @@ func New(opts Options) (func(http.Handler) http.Handler, error) {
 	if opts.Policy == "" {
 		opts.Policy = "default"
 	}
-	if !validPolicyName(opts.Policy) {
+	if !ValidPolicyName(opts.Policy) {
 		return nil, fmt.Errorf("middleware: policy name %q must be 1-64 characters of [a-zA-Z0-9_.-]", opts.Policy)
 	}
+	return Enforce(single{opts}, EnforceOptions{
+		FailOpen: opts.FailOpen, LegacyHeaders: opts.LegacyHeaders, Logger: opts.Logger,
+	}), nil
+}
+
+// single resolves every request to the one policy of Options.
+type single struct{ opts Options }
+
+func (s single) Resolve(r *http.Request) ([]Check, error) {
+	key, err := s.opts.Key(r)
+	if err != nil {
+		return nil, err
+	}
+	cost := int64(1)
+	if s.opts.Cost != nil {
+		cost = s.opts.Cost(r)
+	}
+	return []Check{{Policy: s.opts.Policy, Limiter: s.opts.Limiter, Limit: s.opts.Limit, Key: key, Cost: cost}}, nil
+}
+
+// Check is one limit a request has to pass.
+type Check struct {
+	Policy  string // names the limit in headers and namespaces its keys
+	Limiter limiter.Limiter
+	Limit   limiter.Limit
+	Key     string // client key, e.g. from a KeyFunc
+	Cost    int64
+}
+
+// Resolver decides which limits apply to a request. An error means the
+// client could not be identified and the request is refused with 400.
+// The policy package implements it from a config file.
+type Resolver interface {
+	Resolve(r *http.Request) ([]Check, error)
+}
+
+// EnforceOptions configures Enforce; see the fields of Options.
+type EnforceOptions struct {
+	FailOpen      bool
+	LegacyHeaders bool
+	Logger        *slog.Logger
+}
+
+// Enforce returns middleware that runs every Check the resolver returns for
+// a request, in order. The request goes through only if all of them allow
+// it. Checking stops at the first refusal, so later policies are not
+// charged for a request that will not be served; earlier ones have already
+// been charged, as with any set of independent limits. Headers list every
+// policy that was checked.
+func Enforce(res Resolver, opts EnforceOptions) func(http.Handler) http.Handler {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	m := &mw{opts: opts, policyHeader: policyHeader(opts.Policy, opts.Limit)}
-	return m.wrap, nil
-}
-
-type mw struct {
-	opts         Options
-	policyHeader string
-}
-
-func (m *mw) wrap(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key, err := m.opts.Key(r)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "no_client_key", "cannot identify the client for rate limiting", 0)
-			return
-		}
-		cost := int64(1)
-		if m.opts.Cost != nil {
-			cost = m.opts.Cost(r)
-		}
-
-		d, err := m.opts.Limiter.Allow(r.Context(), m.opts.Policy+":"+key, m.opts.Limit, cost)
-		switch {
-		case errors.Is(err, limiter.ErrInvalidLimit):
-			// The limit is out of range for this limiter's algorithm (GCRA and
-			// the sliding window have tighter bounds than Limit.Validate).
-			// That is a configuration bug, not an outage, so FailOpen does
-			// not apply.
-			m.opts.Logger.ErrorContext(r.Context(), "rate limit misconfigured",
-				slog.String("policy", m.opts.Policy), slog.Any("error", err))
-			writeError(w, http.StatusInternalServerError, "limiter_misconfigured", "rate limiter misconfigured", 0)
-			return
-		case errors.Is(err, limiter.ErrInvalidCost):
-			writeError(w, http.StatusBadRequest, "invalid_cost",
-				fmt.Sprintf("request cost %d exceeds the burst of %d", cost, m.opts.Limit.Burst), 0)
-			return
-		case err != nil:
-			m.opts.Logger.ErrorContext(r.Context(), "rate limiter failed",
-				slog.String("policy", m.opts.Policy), slog.Bool("fail_open", m.opts.FailOpen), slog.Any("error", err))
-			if m.opts.FailOpen {
-				next.ServeHTTP(w, r)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			checks, err := res.Resolve(r)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "no_client_key", "cannot identify the client for rate limiting", 0)
 				return
 			}
-			writeError(w, http.StatusServiceUnavailable, "limiter_unavailable", "rate limiter unavailable", time.Second)
-			return
-		}
 
-		m.setHeaders(w.Header(), d)
-		if !d.Allowed {
-			writeError(w, http.StatusTooManyRequests, "rate_limited", "rate limit exceeded", d.RetryAfter)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+			done := make([]checked, 0, len(checks))
+			for _, c := range checks {
+				d, err := c.Limiter.Allow(r.Context(), c.Policy+":"+c.Key, c.Limit, c.Cost)
+				switch {
+				case errors.Is(err, limiter.ErrInvalidLimit):
+					// The limit is out of range for this limiter's algorithm (GCRA
+					// and the sliding window have tighter bounds than
+					// Limit.Validate). That is a configuration bug, not an
+					// outage, so FailOpen does not apply.
+					opts.Logger.ErrorContext(r.Context(), "rate limit misconfigured",
+						slog.String("policy", c.Policy), slog.Any("error", err))
+					writeError(w, http.StatusInternalServerError, "limiter_misconfigured", "rate limiter misconfigured", 0)
+					return
+				case errors.Is(err, limiter.ErrInvalidCost):
+					writeError(w, http.StatusBadRequest, "invalid_cost",
+						fmt.Sprintf("request cost %d exceeds the burst of %d", c.Cost, c.Limit.Burst), 0)
+					return
+				case err != nil:
+					opts.Logger.ErrorContext(r.Context(), "rate limiter failed",
+						slog.String("policy", c.Policy), slog.Bool("fail_open", opts.FailOpen), slog.Any("error", err))
+					if opts.FailOpen {
+						continue // this policy is skipped; the others still apply
+					}
+					writeError(w, http.StatusServiceUnavailable, "limiter_unavailable", "rate limiter unavailable", time.Second)
+					return
+				}
+				done = append(done, checked{c, d})
+				if !d.Allowed {
+					setHeaders(w.Header(), done, opts.LegacyHeaders)
+					writeError(w, http.StatusTooManyRequests, "rate_limited", "rate limit exceeded: "+c.Policy, d.RetryAfter)
+					return
+				}
+			}
+			if len(done) > 0 {
+				setHeaders(w.Header(), done, opts.LegacyHeaders)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
-func (m *mw) setHeaders(h http.Header, d limiter.Decision) {
-	reset := strconv.FormatInt(ceilSeconds(d.ResetAfter), 10)
-	remaining := strconv.FormatInt(d.Remaining, 10)
-	h.Set("RateLimit-Policy", m.policyHeader)
-	h.Set("RateLimit", `"`+m.opts.Policy+`";r=`+remaining+";t="+reset)
-	if m.opts.LegacyHeaders {
-		h.Set("X-RateLimit-Limit", strconv.FormatInt(m.opts.Limit.Rate, 10))
-		h.Set("X-RateLimit-Remaining", remaining)
-		h.Set("X-RateLimit-Reset", reset)
+type checked struct {
+	Check
+	d limiter.Decision
+}
+
+// setHeaders lists every checked policy. The legacy single-value headers
+// describe the tightest one: the refused policy, or the one with the least
+// quota left.
+func setHeaders(h http.Header, done []checked, legacy bool) {
+	var policies, states []string
+	tight := done[0]
+	for _, c := range done {
+		policies = append(policies, policyHeader(c.Policy, c.Limit))
+		states = append(states, `"`+c.Policy+`";r=`+strconv.FormatInt(c.d.Remaining, 10)+
+			";t="+strconv.FormatInt(ceilSeconds(c.d.ResetAfter), 10))
+		if !c.d.Allowed || (tight.d.Allowed && c.d.Remaining < tight.d.Remaining) {
+			tight = c
+		}
+	}
+	h.Set("RateLimit-Policy", strings.Join(policies, ", "))
+	h.Set("RateLimit", strings.Join(states, ", "))
+	if legacy {
+		h.Set("X-RateLimit-Limit", strconv.FormatInt(tight.Limit.Rate, 10))
+		h.Set("X-RateLimit-Remaining", strconv.FormatInt(tight.d.Remaining, 10))
+		h.Set("X-RateLimit-Reset", strconv.FormatInt(ceilSeconds(tight.d.ResetAfter), 10))
 	}
 }
 
@@ -168,7 +228,9 @@ func ceilSeconds(d time.Duration) int64 {
 	return int64((d + time.Second - 1) / time.Second)
 }
 
-func validPolicyName(s string) bool {
+// ValidPolicyName reports whether s can name a policy: 1-64 characters of
+// [a-zA-Z0-9_.-], safe inside a header string and a Redis key.
+func ValidPolicyName(s string) bool {
 	if len(s) == 0 || len(s) > 64 {
 		return false
 	}

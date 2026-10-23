@@ -263,3 +263,63 @@ func BenchmarkMiddleware(b *testing.B) {
 		h.ServeHTTP(httptest.NewRecorder(), r)
 	}
 }
+
+// countingLimiter answers with a fixed decision and counts calls.
+type countingLimiter struct {
+	allow bool
+	calls int
+}
+
+func (c *countingLimiter) Allow(_ context.Context, _ string, l limiter.Limit, _ int64) (limiter.Decision, error) {
+	c.calls++
+	d := limiter.Decision{Allowed: c.allow, Limit: l, Remaining: 3}
+	if !c.allow {
+		d.RetryAfter = 2 * time.Second
+	}
+	return d, nil
+}
+
+type staticResolver []Check
+
+func (s staticResolver) Resolve(*http.Request) ([]Check, error) { return s, nil }
+
+func TestEnforceStopsAtTheFirstRefusal(t *testing.T) {
+	first, refuses, never := &countingLimiter{allow: true}, &countingLimiter{}, &countingLimiter{allow: true}
+	l := limiter.PerSecond(1, 5)
+	h := Enforce(staticResolver{
+		{Policy: "a", Limiter: first, Limit: l, Key: "k", Cost: 1},
+		{Policy: "b", Limiter: refuses, Limit: l, Key: "k", Cost: 1},
+		{Policy: "c", Limiter: never, Limit: l, Key: "k", Cost: 1},
+	}, EnforceOptions{Logger: quiet})(okHandler())
+
+	rec := do(h, "x")
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "2" {
+		t.Fatalf("status %d, Retry-After %q", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	if first.calls != 1 || refuses.calls != 1 || never.calls != 0 {
+		t.Fatalf("calls a=%d b=%d c=%d: a policy after the refusal was charged", first.calls, refuses.calls, never.calls)
+	}
+	if got := rec.Header().Get("RateLimit"); got != `"a";r=3;t=0, "b";r=3;t=0` {
+		t.Fatalf("RateLimit = %q", got)
+	}
+}
+
+func TestEnforceFailOpenSkipsOnlyTheFailingPolicy(t *testing.T) {
+	ok := &countingLimiter{allow: true}
+	h := Enforce(staticResolver{
+		{Policy: "down", Limiter: failingLimiter{err: errors.New("redis: timeout")}, Limit: limiter.PerSecond(1, 1), Key: "k", Cost: 1},
+		{Policy: "local", Limiter: ok, Limit: limiter.PerSecond(1, 1), Key: "k", Cost: 1},
+	}, EnforceOptions{FailOpen: true, Logger: quiet})(okHandler())
+
+	rec := do(h, "x")
+	if rec.Code != http.StatusOK || ok.calls != 1 || rec.Header().Get("RateLimit") != `"local";r=3;t=0` {
+		t.Fatalf("status %d, calls %d, RateLimit %q", rec.Code, ok.calls, rec.Header().Get("RateLimit"))
+	}
+}
+
+func TestEnforceWithNoMatchingPolicy(t *testing.T) {
+	rec := do(Enforce(staticResolver{}, EnforceOptions{})(okHandler()), "x")
+	if rec.Code != http.StatusOK || rec.Header().Get("RateLimit") != "" {
+		t.Fatalf("status %d, headers %v", rec.Code, rec.Header())
+	}
+}
