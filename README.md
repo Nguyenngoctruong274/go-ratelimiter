@@ -54,7 +54,7 @@ flowchart LR
 | `internal/algo` | Token bucket, GCRA and sliding window as pure functions of (state, limit, now, cost): the reference for the Lua scripts |
 | `internal/memory` | Single-process token-bucket limiter: Redis fallback, or enough for one replica |
 | `internal/middleware` | `net/http` middleware: client keys (IP, API key, user), `RateLimit` headers, 429 + `Retry-After` |
-| `internal/policy` | Rules and tiers with hot reload (day 6) |
+| `internal/policy` | JSON rules: route matching, keys, algorithms, tiers, costs; validated and hot-reloaded |
 
 ## Token bucket
 
@@ -327,6 +327,82 @@ behind a simulated load balancer: 90 concurrent requests from one client,
 exactly 20 (the burst) pass. With the in-memory limiter the middleware adds
 about 1.7 µs per request (`BenchmarkMiddleware`, including the recorder).
 
+## Policies
+
+Instead of one limit in code, a JSON file declares every rule
+([full example](internal/policy/testdata/policies.json)):
+
+```json
+{
+  "policies": [
+    {"name": "global", "key": "ip", "limit": {"rate": 600, "period": "1m", "burst": 100}},
+    {"name": "login", "match": {"methods": ["POST"], "path": "/v1/login"},
+     "key": "ip", "algorithm": "gcra", "limit": {"rate": 5, "period": "1m"}},
+    {"name": "api", "match": {"path_prefix": "/v1/"}, "key": "user|header:X-API-Key|ip",
+     "limit": {"rate": 60, "period": "1m", "burst": 10},
+     "tiers": {"pro": {"limit": {"rate": 1200, "period": "1m", "burst": 200}},
+               "internal": {"unlimited": true}}},
+    {"name": "export", "match": {"methods": ["POST"], "path": "/v1/exports"}, "key": "user",
+     "algorithm": "sliding_window", "cost": 10, "limit": {"rate": 100, "period": "1h"}}
+  ]
+}
+```
+
+```go
+store, err := policy.Open("policies.json", policy.Options{
+    Limiters: map[string]limiter.Limiter{
+        policy.TokenBucket:   redisstore.NewTokenBucket(rdb, ""),
+        policy.GCRA:          redisstore.NewGCRA(rdb, ""),
+        policy.SlidingWindow: redisstore.NewSlidingWindow(rdb, ""),
+    },
+    User: userFromContext, // for "user" keys
+    Tier: planFromContext, // "free", "pro", ...
+}, logger)
+go store.Watch(ctx, 5*time.Second)
+handler = middleware.Enforce(store, middleware.EnforceOptions{})(mux)
+```
+
+**Semantics.**
+
+- Every policy whose `match` fits applies, in file order: a login is
+  limited by `global`, `login` and `api`. The request passes only if all
+  of them allow it. Checking stops at the first refusal, so later policies
+  are not charged for a request that will not be served.
+- `key` lists identities to try in order (`user|header:X-API-Key|ip`). A
+  policy that cannot identify the client is skipped: `export` only limits
+  logged-in users. End with `ip` when anonymous traffic must be limited too.
+- A tier replaces the default `limit`; `unlimited` exempts that tier from
+  that one policy only. Unknown tiers get the default.
+- `cost` charges expensive endpoints more; it must fit in every limit's burst.
+- `burst` defaults to `rate`. Headers list each checked policy:
+  `RateLimit: "global";r=99;t=1, "login";r=4;t=12`.
+
+**Validation.** Parsing rejects unknown fields (a typo such as `"burts"`
+fails instead of silently using a default). Compiling checks each limit
+against its algorithm's own bounds, so a limit GCRA or the sliding window
+cannot enforce fails at load time, not on the first request. Every problem
+is reported at once, with its location:
+
+```text
+invalid policies: policies[1] "a".name: duplicate policy name
+policies[3] "c".match: path "x" must start with /
+policies[4] "d".limit: invalid cost: cost 6 with burst 5
+policies[5] "e".tiers.pro: set limit or unlimited, not both
+```
+
+**Hot reload.** `Store.Watch` polls the file and compares content hashes
+(not modification times, which are coarse on some filesystems and change
+when a Kubernetes ConfigMap is re-mounted unchanged). A valid new file is
+compiled into an immutable set and swapped in atomically, so a request
+never sees half of the old rules and half of the new. An invalid edit is
+rejected as a whole and logged; the last good rules stay in force, because
+a typo in production must not remove every limit. A test resolves from
+four goroutines while the file changes under the race detector.
+
+Changing a rule's limit starts its clients with fresh state: state is kept
+per (key, limit), so a level measured against the old limit is never
+misread under the new one.
+
 ## Quick start
 
 ```bash
@@ -368,7 +444,7 @@ path of its callers, so a slow Redis must become a fast error.
 - [x] **Day 3**: Token bucket on Redis via Lua; equivalence tests against the Go version on real Redis
 - [x] **Day 4**: Sliding window and GCRA (Redis + Go); accuracy comparison
 - [x] **Day 5**: HTTP middleware: key extraction (IP, header, user), `RateLimit-*` headers, `Retry-After`
-- [ ] **Day 6**: Policy engine: multiple rules, tiers, file-based config with hot reload
+- [x] **Day 6**: Policy engine: multiple rules, tiers, file-based config with hot reload
 - [ ] **Day 7**: Failure handling: fail-open / fail-closed, circuit breaker, local fallback
 - [ ] **Day 8**: Service mode: `POST /v1/check`; multi-instance integration tests on shared Redis
 - [ ] **Day 9**: Metrics, benchmarks (checks/s, p99), fewer round trips with pipelining
@@ -376,6 +452,8 @@ path of its callers, so a slow Redis must become a fast error.
 
 ## Notes
 
+- Policy files are JSON rather than YAML: the YAML libraries live on
+  `gopkg.in`, which the build environment of this project cannot fetch.
 - Only HTTP is in scope. A gRPC interceptor would need `google.golang.org/grpc`,
   which the build environment of this project cannot fetch.
 

@@ -1,0 +1,34 @@
+{
+  "policies": [
+    {
+      "name": "global",
+      "key": "ip",
+      "limit": {"rate": 600, "period": "1m", "burst": 100}
+    },
+    {
+      "name": "login",
+      "match": {"methods": ["POST"], "path": "/v1/login"},
+      "key": "ip",
+      "algorithm": "gcra",
+      "limit": {"rate": 5, "period": "1m", "burst": 5}
+    },
+    {
+      "name": "api",
+      "match": {"path_prefix": "/v1/"},
+      "key": "user|header:X-API-Key|ip",
+      "limit": {"rate": 60, "period": "1m", "burst": 10},
+      "tiers": {
+        "pro": {"limit": {"rate": 1200, "period": "1m", "burst": 200}},
+        "internal": {"unlimited": true}
+      }
+    },
+    {
+      "name": "export",
+      "match": {"methods": ["POST"], "path": "/v1/exports"},
+      "key": "user",
+      "algorithm": "sliding_window",
+      "cost": 10,
+      "limit": {"rate": 100, "period": "1h"}
+    }
+  ]
+}
