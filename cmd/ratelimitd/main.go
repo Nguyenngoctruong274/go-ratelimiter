@@ -9,16 +9,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/Nguyenngoctruong274/go-ratelimiter/internal/config"
-	"github.com/Nguyenngoctruong274/go-ratelimiter/internal/httpapi"
-	"github.com/Nguyenngoctruong274/go-ratelimiter/internal/redisstore"
 )
-
-var errDraining = errors.New("shutting down")
 
 func main() {
 	if err := run(); err != nil {
@@ -42,29 +37,16 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	startCtx, cancelStart := context.WithTimeout(ctx, 10*time.Second)
-	defer cancelStart()
-	rdb, err := redisstore.Open(startCtx, cfg.RedisURL)
+	svc, err := newService(ctx, cfg, logger)
 	if err != nil {
 		return err
 	}
-	defer rdb.Close()
-	logger.Info("redis ready")
-
-	// Readiness turns false the moment shutdown starts, so load balancers
-	// stop routing new requests while in-flight ones finish.
-	var draining atomic.Bool
-	ping := redisstore.Pinger(rdb)
-	ready := func(ctx context.Context) error {
-		if draining.Load() {
-			return errDraining
-		}
-		return ping(ctx)
-	}
+	defer svc.Close()
+	logger.Info("redis ready", slog.String("on_redis_failure", string(cfg.OnRedisFailure)))
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(logger, httpapi.Options{Ready: ready}),
+		Handler:           svc.handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -87,7 +69,9 @@ func run() error {
 	}
 
 	logger.Info("shutdown started", slog.Duration("drain", cfg.ShutdownDrain))
-	draining.Store(true)
+	// Readiness turns false the moment shutdown starts, so load balancers
+	// stop routing new requests while in-flight ones finish.
+	svc.draining.Store(true)
 	time.Sleep(cfg.ShutdownDrain)
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)

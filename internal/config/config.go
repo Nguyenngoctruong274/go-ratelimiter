@@ -21,7 +21,34 @@ type Config struct {
 	// closing the listener. 0 locally; a few seconds behind a load balancer.
 	ShutdownDrain time.Duration
 	LogLevel      string
+
+	// PolicyFile is the JSON policy file served by POST /v1/check.
+	PolicyFile string
+	// PolicyReload is how often the policy file is checked for changes;
+	// 0 disables reloading.
+	PolicyReload time.Duration
+
+	// OnRedisFailure says what a check does while Redis is unavailable:
+	// fail closed (503), fail open (allow), or decide locally.
+	OnRedisFailure FailureMode
+	// Replicas is the number of instances sharing Redis. In local mode
+	// each one enforces 1/Replicas of every limit during an outage.
+	Replicas int
+	// RedisTimeout bounds one check on Redis.
+	RedisTimeout     time.Duration
+	BreakerThreshold int
+	BreakerCooldown  time.Duration
 }
+
+// FailureMode is the value of RL_ON_REDIS_FAILURE.
+type FailureMode string
+
+// The supported failure modes.
+const (
+	FailClosed FailureMode = "closed"
+	FailOpen   FailureMode = "open"
+	FailLocal  FailureMode = "local"
+)
 
 // Load reads configuration from environment variables, applying defaults
 // for optional values. It reports every invalid value at once so that a
@@ -36,9 +63,44 @@ func load(getenv func(string) string) (Config, error) {
 		RedisURL:        getenv("RL_REDIS_URL"),
 		ShutdownTimeout: 15 * time.Second,
 		LogLevel:        valueOr(getenv("RL_LOG_LEVEL"), "info"),
+
+		PolicyFile:       getenv("RL_POLICY_FILE"),
+		PolicyReload:     5 * time.Second,
+		OnRedisFailure:   FailureMode(valueOr(getenv("RL_ON_REDIS_FAILURE"), string(FailClosed))),
+		Replicas:         1,
+		RedisTimeout:     100 * time.Millisecond,
+		BreakerThreshold: 5,
+		BreakerCooldown:  5 * time.Second,
 	}
 
 	var errs []error
+	duration := func(name string, dst *time.Duration, allowZero bool) {
+		raw := getenv(name)
+		if raw == "" {
+			return
+		}
+		d, err := time.ParseDuration(raw)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+		case d < 0 || (d == 0 && !allowZero):
+			errs = append(errs, fmt.Errorf("%s: must be positive", name))
+		default:
+			*dst = d
+		}
+	}
+	positiveInt := func(name string, dst *int) {
+		raw := getenv(name)
+		if raw == "" {
+			return
+		}
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			errs = append(errs, fmt.Errorf("%s: must be a positive integer", name))
+			return
+		}
+		*dst = n
+	}
 
 	if cfg.RedisURL == "" {
 		errs = append(errs, errors.New("RL_REDIS_URL: required"))
@@ -66,6 +128,20 @@ func load(getenv func(string) string) (Config, error) {
 			cfg.ShutdownDrain = d
 		}
 	}
+
+	if cfg.PolicyFile == "" {
+		errs = append(errs, errors.New("RL_POLICY_FILE: required"))
+	}
+	duration("RL_POLICY_RELOAD", &cfg.PolicyReload, true)
+	switch cfg.OnRedisFailure {
+	case FailClosed, FailOpen, FailLocal:
+	default:
+		errs = append(errs, fmt.Errorf("RL_ON_REDIS_FAILURE: must be closed, open or local, got %s", strconv.Quote(string(cfg.OnRedisFailure))))
+	}
+	positiveInt("RL_REPLICAS", &cfg.Replicas)
+	duration("RL_REDIS_TIMEOUT", &cfg.RedisTimeout, false)
+	positiveInt("RL_BREAKER_THRESHOLD", &cfg.BreakerThreshold)
+	duration("RL_BREAKER_COOLDOWN", &cfg.BreakerCooldown, false)
 
 	switch cfg.LogLevel {
 	case "debug", "info", "warn", "error":

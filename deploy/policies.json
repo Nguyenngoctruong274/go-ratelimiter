@@ -1,0 +1,27 @@
+{
+  "policies": [
+    {
+      "name": "api",
+      "key": "header:X-API-Key|ip",
+      "algorithm": "gcra",
+      "limit": {"rate": 60, "period": "1m", "burst": 10},
+      "tiers": {
+        "pro": {"limit": {"rate": 1200, "period": "1m", "burst": 200}},
+        "internal": {"unlimited": true}
+      }
+    },
+    {
+      "name": "login",
+      "key": "ip",
+      "algorithm": "gcra",
+      "limit": {"rate": 5, "period": "1m", "burst": 5}
+    },
+    {
+      "name": "export",
+      "key": "header:X-API-Key|ip",
+      "algorithm": "sliding_window",
+      "cost": 10,
+      "limit": {"rate": 100, "period": "1h"}
+    }
+  ]
+}

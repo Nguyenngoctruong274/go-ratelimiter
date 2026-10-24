@@ -1,6 +1,7 @@
 .DEFAULT_GOAL := help
 BIN := bin/ratelimitd
 export RL_REDIS_URL ?= redis://localhost:6379/0
+export RL_POLICY_FILE ?= deploy/policies.json
 
 .PHONY: help
 help: ## Show this help

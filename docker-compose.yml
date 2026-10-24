@@ -17,6 +17,10 @@ services:
       RL_REDIS_URL: redis://redis:6379/0
       RL_LOG_LEVEL: info
       RL_SHUTDOWN_DRAIN: 2s
+      RL_POLICY_FILE: /etc/ratelimitd/policies.json
+      RL_ON_REDIS_FAILURE: local
+    volumes:
+      - ./deploy/policies.json:/etc/ratelimitd/policies.json:ro
     ports:
       - "8080:8080"
     depends_on:
