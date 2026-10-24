@@ -54,6 +54,11 @@ func (s *Store) Resolve(r *http.Request) ([]middleware.Check, error) {
 	return s.current.Load().Resolve(r)
 }
 
+// Lookup finds a policy in the current Set; see Set.Lookup.
+func (s *Store) Lookup(name, tier string) (Policy, bool) {
+	return s.current.Load().Lookup(name, tier)
+}
+
 // Current returns the Set in force.
 func (s *Store) Current() *Set { return s.current.Load() }
 

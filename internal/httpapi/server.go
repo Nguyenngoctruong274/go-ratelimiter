@@ -1,5 +1,6 @@
-// Package httpapi exposes ratelimitd over HTTP. Day 1 serves the probes;
-// the check and policy endpoints are added as the limiter grows.
+// Package httpapi exposes ratelimitd over HTTP: the probes, and
+// POST /v1/check for services that ask for a decision over the network
+// instead of embedding the middleware.
 package httpapi
 
 import (
@@ -20,20 +21,29 @@ type Options struct {
 	// Ready reports whether the service can take traffic (dependencies up,
 	// not draining). nil means always ready.
 	Ready func(context.Context) error
+	// Policies serves POST /v1/check; nil leaves the endpoint out.
+	Policies Policies
+	// FailOpen answers "allowed" when the limiter fails instead of 503.
+	FailOpen bool
 }
 
 type api struct {
-	logger *slog.Logger
-	ready  func(context.Context) error
+	logger   *slog.Logger
+	ready    func(context.Context) error
+	policies Policies
+	failOpen bool
 }
 
 // NewHandler returns the root handler of the service.
 func NewHandler(logger *slog.Logger, opts Options) http.Handler {
-	a := &api{logger: logger, ready: opts.Ready}
+	a := &api{logger: logger, ready: opts.Ready, policies: opts.Policies, failOpen: opts.FailOpen}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /readyz", a.readyz)
+	if a.policies != nil {
+		mux.HandleFunc("POST /v1/check", a.check)
+	}
 	return a.withRequestID(a.withAccessLog(mux))
 }
 

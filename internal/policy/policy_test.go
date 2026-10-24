@@ -413,3 +413,34 @@ func TestPoliciesThroughMiddleware(t *testing.T) {
 		t.Fatalf("other route: %d %q", rec.Code, rec.Header().Get("RateLimit"))
 	}
 }
+
+func TestLookup(t *testing.T) {
+	set := loadExample(t, testOptions())
+	tests := []struct {
+		name, policy, tier string
+		want               Policy
+		found              bool
+	}{
+		{"default limit", "api", "", Policy{Name: "api", Limit: limiter.PerMinute(60, 10), Cost: 1}, true},
+		{"unknown tier gets the default", "api", "gold", Policy{Name: "api", Limit: limiter.PerMinute(60, 10), Cost: 1}, true},
+		{"tier limit", "api", "pro", Policy{Name: "api", Limit: limiter.PerMinute(1200, 200), Cost: 1}, true},
+		{"unlimited tier", "api", "internal", Policy{Name: "api", Cost: 1, Unlimited: true}, true},
+		{"policy cost", "export", "", Policy{Name: "export", Limit: limiter.Limit{Rate: 100, Period: time.Hour, Burst: 100}, Cost: 10}, true},
+		{"unknown policy", "nope", "", Policy{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, found := set.Lookup(tt.policy, tt.tier)
+			if found != tt.found {
+				t.Fatalf("found = %v, want %v", found, tt.found)
+			}
+			got.Limiter = nil
+			if got != tt.want {
+				t.Fatalf("Lookup(%q, %q) = %+v, want %+v", tt.policy, tt.tier, got, tt.want)
+			}
+		})
+	}
+	if p, _ := set.Lookup("export", ""); p.Limiter != (fakeLimiter{"sw"}) {
+		t.Fatalf("export uses %v, want the sliding window limiter", p.Limiter)
+	}
+}

@@ -190,6 +190,36 @@ func (s *Set) Resolve(r *http.Request) ([]middleware.Check, error) {
 	return out, nil
 }
 
+// Policy is one named policy at one tier, for callers that name the policy
+// and the client themselves instead of sending an HTTP request through
+// Resolve, such as the /v1/check endpoint.
+type Policy struct {
+	Name    string
+	Limiter limiter.Limiter
+	Limit   limiter.Limit
+	Cost    int64 // the policy's cost per request
+	// Unlimited is set when the tier is exempt from the policy; Limit is
+	// then zero and nothing should be checked.
+	Unlimited bool
+}
+
+// Lookup returns the policy called name at tier. A tier the policy does not
+// list gets its default limit, as in Resolve.
+func (s *Set) Lookup(name, tier string) (Policy, bool) {
+	for i := range s.policies {
+		p := &s.policies[i]
+		if p.name != name {
+			continue
+		}
+		out := Policy{Name: p.name, Limiter: p.limiter, Limit: p.limit, Cost: p.cost}
+		if t, ok := p.tiers[tier]; ok {
+			out.Limit, out.Unlimited = t.limit, t.unlimited
+		}
+		return out, true
+	}
+	return Policy{}, false
+}
+
 // Names lists the policies in file order.
 func (s *Set) Names() []string {
 	names := make([]string, len(s.policies))
