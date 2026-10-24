@@ -39,9 +39,10 @@ flowchart LR
     MW --> L{{Limiter}}
     S[Other services] -->|POST /v1/check| API[ratelimitd API] --> L
     L --> P[policy<br/>rules, tiers, hot reload]
-    L --> RS[redisstore<br/>Lua: token bucket / sliding window / GCRA]
+    L --> FO[failover<br/>timeout + circuit breaker]
+    FO --> RS[redisstore<br/>Lua: token bucket / sliding window / GCRA]
     RS --> R[(Redis)]
-    L -. Redis down .-> FB[fallback<br/>fail-open / fail-closed / local]
+    FO -. Redis down .-> FB[local share<br/>in memory]
 ```
 
 | Package | Responsibility |
@@ -55,6 +56,8 @@ flowchart LR
 | `internal/memory` | Single-process token-bucket limiter: Redis fallback, or enough for one replica |
 | `internal/middleware` | `net/http` middleware: client keys (IP, API key, user), `RateLimit` headers, 429 + `Retry-After` |
 | `internal/policy` | JSON rules: route matching, keys, algorithms, tiers, costs; validated and hot-reloaded |
+| `internal/breaker` | Circuit breaker: consecutive-failure threshold, cooldown, one half-open probe |
+| `internal/failover` | Wraps the Redis limiter with a timeout and a breaker; local fallback or `ErrUnavailable` during an outage |
 
 ## Token bucket
 
@@ -315,7 +318,7 @@ spoof and checks it is ignored.
 
 | Situation | Response |
 |---|---|
-| Limiter error (Redis down) | `503` with `Retry-After: 1`, or pass through with `FailOpen: true` |
+| Limiter error (Redis down) | `503` with `Retry-After: 1`, or pass through with `FailOpen: true`; see [When Redis fails](#when-redis-fails) for a local fallback |
 | Limit out of range for the algorithm | `500`; a config bug is never "failed open" |
 | `Cost` above the burst | `400`: no amount of waiting would help |
 | No key found | `400` |
@@ -403,6 +406,60 @@ Changing a rule's limit starts its clients with fresh state: state is kept
 per (key, limit), so a level measured against the old limit is never
 misread under the new one.
 
+## When Redis fails
+
+Every instance depends on Redis for every decision, so an outage has to be
+planned for. `failover` wraps the Redis limiter:
+
+```go
+local := memory.New(limiter.SystemClock{}) // run local.Sweep() periodically
+lim, err := failover.New(redisstore.NewGCRA(rdb, ""), failover.Options{
+    Fallback: local,                  // nil: return failover.ErrUnavailable
+    Replicas: 4,                      // instances sharing this Redis
+    Timeout:  50 * time.Millisecond,  // a slow check counts as a failure
+    Breaker:  breaker.Options{Threshold: 5, Cooldown: 5 * time.Second},
+})
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: Threshold consecutive failures
+    Open --> HalfOpen: Cooldown passed, next check probes Redis
+    HalfOpen --> Closed: probe succeeds
+    HalfOpen --> Open: probe fails (cooldown restarts)
+```
+
+- **Fast failure.** A check gets at most `Timeout` on Redis. After
+  `Threshold` consecutive failures the breaker opens and checks stop going
+  to Redis at all, so a dead Redis costs microseconds per request instead of
+  a dial timeout, and a struggling one is not hammered while it recovers.
+- **One probe.** After `Cooldown` a single check probes Redis; every other
+  check keeps using the fallback until it answers. A failed probe restarts
+  the cooldown.
+- **Three behaviors, one choice.** With no fallback the limiter returns
+  `ErrUnavailable` and the middleware **fails closed** (503) or, with
+  `FailOpen`, **fails open** for that policy. With a fallback it decides
+  **locally**: each instance enforces `1/Replicas` of every limit (rate and
+  burst rounded up, the burst never below a valid cost), so the fleet as a
+  whole grants about one limit, not `Replicas` of them. `TestMiddlewareWithRedisDown`
+  shows the three side by side.
+- **Only real failures count.** An invalid limit or cost is a bug, not an
+  outage, and a check the caller's context canceled says nothing about
+  Redis: neither trips the breaker. Results from calls that started before
+  the breaker changed state are discarded, so a slow success from before
+  an outage cannot close it.
+- **What is lost.** Local decisions use the token bucket whatever the
+  policy's algorithm, and assume traffic is spread evenly across instances.
+  Grants made locally are not written to Redis, so after recovery a client
+  may get up to one extra local share. State changes are logged
+  (`rate limiter breaker changed state`, `warn` when it opens).
+
+`TestRedisOutageAndRecovery` runs this against a real Redis behind a TCP
+proxy the test cuts and restores: during the cut every decision comes from
+the local share (2 of 10 with 5 replicas), and once Redis is back a probe
+closes the breaker and decisions continue from the state Redis kept.
+
 ## Quick start
 
 ```bash
@@ -445,7 +502,7 @@ path of its callers, so a slow Redis must become a fast error.
 - [x] **Day 4**: Sliding window and GCRA (Redis + Go); accuracy comparison
 - [x] **Day 5**: HTTP middleware: key extraction (IP, header, user), `RateLimit-*` headers, `Retry-After`
 - [x] **Day 6**: Policy engine: multiple rules, tiers, file-based config with hot reload
-- [ ] **Day 7**: Failure handling: fail-open / fail-closed, circuit breaker, local fallback
+- [x] **Day 7**: Failure handling: fail-open / fail-closed, circuit breaker, local fallback
 - [ ] **Day 8**: Service mode: `POST /v1/check`; multi-instance integration tests on shared Redis
 - [ ] **Day 9**: Metrics, benchmarks (checks/s, p99), fewer round trips with pipelining
 - [ ] **Day 10**: Final README, design decisions, v1.0.0
