@@ -36,6 +36,8 @@ type Options struct {
 	// down). The default is to fail closed with 503: an outage of the
 	// limiter must not silently turn into unlimited traffic unless the
 	// operator chose that.
+	// Wrap the limiter in failover.New for a circuit breaker and a local
+	// fallback, so that an outage rarely reaches this choice.
 	FailOpen bool
 	// LegacyHeaders also sets X-RateLimit-Limit/-Remaining/-Reset, which
 	// many existing clients read.
