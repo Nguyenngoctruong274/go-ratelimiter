@@ -47,9 +47,9 @@ flowchart LR
 
 | Package | Responsibility |
 |---|---|
-| `cmd/ratelimitd` | Service wiring, graceful shutdown |
+| `cmd/ratelimitd` | Service wiring (Redis, failover, policies), graceful shutdown |
 | `internal/config` | Environment configuration with validation |
-| `internal/httpapi` | Probes now; check and policy endpoints later |
+| `internal/httpapi` | Probes and `POST /v1/check` |
 | `internal/redisstore` | Redis connection; token bucket, GCRA and sliding window as atomic Lua scripts sharing state across instances |
 | `internal/limiter` | `Limit`, `Decision`, the `Limiter` interface, `Clock` |
 | `internal/algo` | Token bucket, GCRA and sliding window as pure functions of (state, limit, now, cost): the reference for the Lua scripts |
@@ -460,13 +460,69 @@ proxy the test cuts and restores: during the cut every decision comes from
 the local share (2 of 10 with 5 replicas), and once Redis is back a probe
 closes the breaker and decisions continue from the state Redis kept.
 
+## Service mode
+
+Services that cannot embed the Go middleware (other languages, an API
+gateway) ask `ratelimitd` for a decision over HTTP. They name a policy
+from the server's file and identify the client:
+
+```bash
+curl -s -XPOST localhost:8080/v1/check \
+  -d '{"policy": "login", "key": "ip:203.0.113.7"}'
+```
+
+```json
+{"allowed":true,"policy":"login","limit":{"rate":5,"period_ms":60000,"burst":5},
+ "remaining":4,"retry_after_ms":0,"reset_after_ms":12000}
+```
+
+| Field | |
+|---|---|
+| `policy` | Required. A policy name from `RL_POLICY_FILE` |
+| `key` | Required, 1–256 bytes. The client, as the caller identifies it |
+| `tier` | Optional. Picks the tier's limit; an `unlimited` tier answers `{"allowed":true,"unlimited":true}` |
+| `cost` | Optional. Defaults to the policy's `cost`; `0` reads the state without consuming |
+
+- **Callers cannot choose limits.** The request names a policy; the limit
+  lives in the server's file. A compromised or buggy caller can spend a
+  client's quota but never raise it.
+- **A denial is a `200`.** The check succeeded and the answer is "no":
+  `allowed:false` with `retry_after_ms` (rounded up). Status codes are
+  kept for failures of the check itself: `400` bad body or cost, `404`
+  unknown policy, `500` a limit the algorithm cannot enforce, `503` Redis
+  unavailable (or `allowed:true, fail_open:true` with
+  `RL_ON_REDIS_FAILURE=open`).
+- **One state with the middleware.** Keys are namespaced as
+  `<policy>:<key>`, exactly as the middleware does, so a Go service using
+  the middleware and a gateway calling `/v1/check` with the same policy
+  and key draw from the same quota.
+- **Readiness.** Only a fail-closed instance reports not-ready when Redis
+  is down. In `open` or `local` mode it can still answer, and failing
+  readiness would make the load balancer drop every instance at once.
+
+Every Redis limiter is wrapped in `failover` (see [When Redis fails](#when-redis-fails))
+with the `RL_ON_REDIS_FAILURE`, `RL_REPLICAS`, `RL_REDIS_TIMEOUT` and
+`RL_BREAKER_*` settings, and the policy file is reloaded every
+`RL_POLICY_RELOAD`.
+
+**Multi-instance tests** (`cmd/ratelimitd`, against a real Redis) start
+three fully wired instances, each with its own connection pool, from the
+same config:
+
+| Test | What it proves |
+|---|---|
+| `TestInstancesEnforceOneLimit` | 240 concurrent checks for one client spread over 3 instances, for each algorithm: exactly `Burst` (25) allowed, and the grants report remaining counts 24…0 once each, so every check saw the state the previous one left |
+| `TestInstancesShareStateSequentially` | Alternating instances continue one count; an unlimited tier is never counted |
+| `TestPolicyReloadReachesEveryInstance` | Editing the shared file changes the limit on every instance |
+
 ## Quick start
 
 ```bash
 make up          # Redis in Docker
-make run         # ratelimitd on :8080
+make run         # ratelimitd on :8080 with deploy/policies.json
 curl localhost:8080/healthz   # {"status":"ok"}
-curl localhost:8080/readyz    # {"status":"ready"}, 503 if Redis is unreachable
+curl -XPOST localhost:8080/v1/check -d '{"policy":"api","key":"demo"}'
+curl localhost:8080/readyz    # {"status":"ready"}; 503 if Redis is down in closed mode
 make test-redis  # unit tests + tests against the real Redis
 ```
 
@@ -481,6 +537,13 @@ Or run everything in containers: `make stack`.
 | `RL_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `RL_SHUTDOWN_TIMEOUT` | `15s` | Maximum time to finish in-flight requests |
 | `RL_SHUTDOWN_DRAIN` | `0` | Time `/readyz` reports 503 before the listener closes |
+| `RL_POLICY_FILE` | required | JSON policy file served by `/v1/check` (`deploy/policies.json` with `make run`) |
+| `RL_POLICY_RELOAD` | `5s` | How often the policy file is checked for changes; `0` disables |
+| `RL_ON_REDIS_FAILURE` | `closed` | `closed` (503), `open` (allow) or `local` (in-memory share of each limit) |
+| `RL_REPLICAS` | `1` | Instances sharing Redis; in `local` mode each enforces `1/RL_REPLICAS` of a limit |
+| `RL_REDIS_TIMEOUT` | `100ms` | Longest a check waits for Redis before it counts as a failure |
+| `RL_BREAKER_THRESHOLD` | `5` | Consecutive Redis failures that open the circuit breaker |
+| `RL_BREAKER_COOLDOWN` | `5s` | How long the breaker stays open before probing Redis |
 
 Invalid configuration is reported all at once at startup. Redis timeouts are
 deliberately short (dial 2s, read/write 500ms): a limiter sits on the hot
@@ -490,7 +553,8 @@ path of its callers, so a slow Redis must become a fast error.
 
 - `GET /healthz`: liveness. Does **not** touch Redis, so a Redis blip does not
   restart every pod.
-- `GET /readyz`: readiness. Pings Redis and returns 503 while draining.
+- `GET /readyz`: readiness. Returns 503 while draining, and pings Redis
+  when `RL_ON_REDIS_FAILURE=closed`.
 - On `SIGTERM`: readiness turns 503, the service waits `RL_SHUTDOWN_DRAIN`,
   then shuts the HTTP server down within `RL_SHUTDOWN_TIMEOUT`.
 
@@ -503,7 +567,7 @@ path of its callers, so a slow Redis must become a fast error.
 - [x] **Day 5**: HTTP middleware: key extraction (IP, header, user), `RateLimit-*` headers, `Retry-After`
 - [x] **Day 6**: Policy engine: multiple rules, tiers, file-based config with hot reload
 - [x] **Day 7**: Failure handling: fail-open / fail-closed, circuit breaker, local fallback
-- [ ] **Day 8**: Service mode: `POST /v1/check`; multi-instance integration tests on shared Redis
+- [x] **Day 8**: Service mode: `POST /v1/check`; multi-instance integration tests on shared Redis
 - [ ] **Day 9**: Metrics, benchmarks (checks/s, p99), fewer round trips with pipelining
 - [ ] **Day 10**: Final README, design decisions, v1.0.0
 
