@@ -32,6 +32,23 @@ type Store struct {
 
 	mu  sync.Mutex // serializes reloads
 	sum [sha256.Size]byte
+
+	applied, rejected atomic.Uint64
+	failing           atomic.Bool
+}
+
+// ReloadStats counts the Sets installed (the first load included) and the
+// files rejected. Failing reports that the last attempt was rejected: the
+// file on disk is not the policy being enforced.
+type ReloadStats struct {
+	Applied  uint64
+	Rejected uint64
+	Failing  bool
+}
+
+// ReloadStats returns the counts so far.
+func (s *Store) ReloadStats() ReloadStats {
+	return ReloadStats{Applied: s.applied.Load(), Rejected: s.rejected.Load(), Failing: s.failing.Load()}
 }
 
 var _ middleware.Resolver = (*Store)(nil)
@@ -67,7 +84,18 @@ func (s *Store) Current() *Set { return s.current.Load() }
 func (s *Store) Reload() (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	changed, err := s.reloadLocked()
+	switch {
+	case err != nil:
+		s.rejected.Add(1)
+	case changed:
+		s.applied.Add(1)
+	}
+	s.failing.Store(err != nil)
+	return changed, err
+}
 
+func (s *Store) reloadLocked() (bool, error) {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		return false, fmt.Errorf("read policies: %w", err)

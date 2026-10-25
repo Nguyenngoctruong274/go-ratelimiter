@@ -62,28 +62,36 @@ func (a *api) check(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCheckBody))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
+		a.checks.Inc("", "invalid")
 		writeError(w, http.StatusBadRequest, "invalid_body", "invalid JSON body: "+err.Error())
 		return
 	}
 	if dec.More() {
+		a.checks.Inc("", "invalid")
 		writeError(w, http.StatusBadRequest, "invalid_body", "body must hold one JSON object")
 		return
 	}
 	switch {
 	case req.Policy == "":
+		a.checks.Inc("", "invalid")
 		writeError(w, http.StatusBadRequest, "invalid_body", "policy is required")
 		return
 	case req.Key == "" || len(req.Key) > maxKeyLen:
+		a.checks.Inc("", "invalid")
 		writeError(w, http.StatusBadRequest, "invalid_body", fmt.Sprintf("key must be 1-%d bytes", maxKeyLen))
 		return
 	}
 
 	p, ok := a.policies.Lookup(req.Policy, req.Tier)
 	if !ok {
+		// Not labelled with the requested name: callers must not be able
+		// to create time series.
+		a.checks.Inc("", "unknown_policy")
 		writeError(w, http.StatusNotFound, "unknown_policy", fmt.Sprintf("no policy named %q", req.Policy))
 		return
 	}
 	if p.Unlimited {
+		a.checks.Inc(p.Name, "unlimited")
 		writeJSON(w, http.StatusOK, checkResponse{Allowed: true, Policy: p.Name, Unlimited: true})
 		return
 	}
@@ -97,10 +105,12 @@ func (a *api) check(w http.ResponseWriter, r *http.Request) {
 	d, err := p.Limiter.Allow(r.Context(), p.Name+":"+req.Key, p.Limit, cost)
 	switch {
 	case errors.Is(err, limiter.ErrInvalidCost):
+		a.checks.Inc(p.Name, "invalid")
 		writeError(w, http.StatusBadRequest, "invalid_cost",
 			fmt.Sprintf("cost %d must be between 0 and the burst of %d", cost, p.Limit.Burst))
 		return
 	case errors.Is(err, limiter.ErrInvalidLimit):
+		a.checks.Inc(p.Name, "misconfigured")
 		a.logger.ErrorContext(r.Context(), "rate limit misconfigured", slog.String("policy", p.Name), slog.Any("error", err))
 		writeError(w, http.StatusInternalServerError, "limiter_misconfigured", "rate limiter misconfigured")
 		return
@@ -108,14 +118,21 @@ func (a *api) check(w http.ResponseWriter, r *http.Request) {
 		a.logger.ErrorContext(r.Context(), "rate limiter failed",
 			slog.String("policy", p.Name), slog.Bool("fail_open", a.failOpen), slog.Any("error", err))
 		if a.failOpen {
+			a.checks.Inc(p.Name, "fail_open")
 			writeJSON(w, http.StatusOK, checkResponse{Allowed: true, Policy: p.Name, Limit: toLimitJSON(p.Limit), FailOpen: true})
 			return
 		}
+		a.checks.Inc(p.Name, "unavailable")
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, "limiter_unavailable", "rate limiter unavailable")
 		return
 	}
 
+	if d.Allowed {
+		a.checks.Inc(p.Name, "allowed")
+	} else {
+		a.checks.Inc(p.Name, "denied")
+	}
 	writeJSON(w, http.StatusOK, checkResponse{
 		Allowed:      d.Allowed,
 		Policy:       p.Name,

@@ -27,6 +27,7 @@ func TestLoadDefaults(t *testing.T) {
 		RedisTimeout:     100 * time.Millisecond,
 		BreakerThreshold: 5,
 		BreakerCooldown:  5 * time.Second,
+		PipelineSenders:  4,
 	}
 	if cfg != want {
 		t.Fatalf("got %+v, want %+v", cfg, want)
@@ -47,6 +48,8 @@ func TestLoadOverrides(t *testing.T) {
 		"RL_REDIS_TIMEOUT":     "50ms",
 		"RL_BREAKER_THRESHOLD": "3",
 		"RL_BREAKER_COOLDOWN":  "2s",
+
+		"RL_REDIS_PIPELINE_SENDERS": "0",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -56,7 +59,8 @@ func TestLoadOverrides(t *testing.T) {
 		t.Fatalf("unexpected config %+v", cfg)
 	}
 	if cfg.PolicyFile != "/etc/rl/policies.json" || cfg.PolicyReload != 0 || cfg.OnRedisFailure != FailLocal ||
-		cfg.Replicas != 4 || cfg.RedisTimeout != 50*time.Millisecond || cfg.BreakerThreshold != 3 || cfg.BreakerCooldown != 2*time.Second {
+		cfg.Replicas != 4 || cfg.RedisTimeout != 50*time.Millisecond || cfg.BreakerThreshold != 3 || cfg.BreakerCooldown != 2*time.Second ||
+		cfg.PipelineSenders != 0 {
 		t.Fatalf("unexpected service config %+v", cfg)
 	}
 }
@@ -107,9 +111,11 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 				"RL_REDIS_URL": "redis://localhost:6379", "RL_POLICY_FILE": "p.json",
 				"RL_ON_REDIS_FAILURE": "maybe", "RL_REPLICAS": "0", "RL_REDIS_TIMEOUT": "0s",
 				"RL_BREAKER_THRESHOLD": "many", "RL_BREAKER_COOLDOWN": "-1s", "RL_POLICY_RELOAD": "-5s",
+				"RL_REDIS_PIPELINE_SENDERS": "-1",
 			},
-			want: []string{"RL_ON_REDIS_FAILURE: must be closed, open or local", "RL_REPLICAS", "RL_REDIS_TIMEOUT: must be positive",
-				"RL_BREAKER_THRESHOLD", "RL_BREAKER_COOLDOWN", "RL_POLICY_RELOAD"},
+			want: []string{"RL_ON_REDIS_FAILURE: must be closed, open or local", "RL_REPLICAS: must be positive", "RL_REDIS_TIMEOUT: must be positive",
+				"RL_BREAKER_THRESHOLD: must be a non-negative integer", "RL_BREAKER_COOLDOWN", "RL_POLICY_RELOAD",
+				"RL_REDIS_PIPELINE_SENDERS: must be a non-negative integer"},
 		},
 	}
 	for _, tt := range tests {

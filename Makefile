@@ -37,6 +37,10 @@ compare: ## Print the accuracy comparison of the algorithms
 bench: ## Run benchmarks
 	go test -run '^$$' -bench . -benchmem ./internal/...
 
+.PHONY: bench-redis
+bench-redis: ## Benchmark checks/s and p99 on Redis, direct vs pipelined (needs `make up`)
+	RL_TEST_REDIS_URL=redis://localhost:6379/15 go test -run '^$$' -bench 'Pipeline|ServiceCheck' -benchtime 3s ./internal/redisstore ./cmd/ratelimitd
+
 .PHONY: cover
 cover: ## Run tests and print total coverage
 	go test -race -coverprofile=coverage.out ./...

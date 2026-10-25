@@ -280,6 +280,9 @@ func TestStoreReload(t *testing.T) {
 	if changed, err := s.Reload(); changed || err == nil || burst() != 3 {
 		t.Fatalf("broken edit: changed=%t err=%v burst=%d", changed, err, burst())
 	}
+	if st := s.ReloadStats(); st != (ReloadStats{Applied: 2, Rejected: 1, Failing: true}) {
+		t.Fatalf("after a broken edit: %+v", st)
+	}
 	// Fixing the file recovers, even if it is identical to the broken one's predecessor.
 	writeFile(t, path, relaxed)
 	if changed, err := s.Reload(); err != nil || changed {
@@ -288,6 +291,10 @@ func TestStoreReload(t *testing.T) {
 	writeFile(t, path, strict)
 	if changed, err := s.Reload(); !changed || err != nil || burst() != 1 {
 		t.Fatalf("second edit: changed=%t err=%v", changed, err)
+	}
+	// The first load counts as applied; unchanged checks count as nothing.
+	if st := s.ReloadStats(); st != (ReloadStats{Applied: 3, Rejected: 1}) {
+		t.Fatalf("after recovering: %+v", st)
 	}
 }
 

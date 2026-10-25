@@ -37,15 +37,23 @@ const testPolicies = `{"policies": [
   {"name": "sw", "key": "ip", "algorithm": "sliding_window", "limit": {"rate": 1, "period": "1h", "burst": %[1]d}}
 ]}`
 
-// cluster starts n ratelimitd instances, each with its own Redis pool,
-// sharing one Redis and one policy file.
+// cluster is n ratelimitd instances, each with its own Redis pool, sharing
+// one Redis and one policy file.
 type cluster struct {
 	urls   []string
 	policy string
 	client *http.Client
 }
 
-func startCluster(t *testing.T, n, burst int) *cluster {
+// startCluster starts a cluster with the default pipelining.
+func startCluster(t testing.TB, n, burst int) *cluster {
+	t.Helper()
+	return startClusterWith(t, n, burst, 4)
+}
+
+// startClusterWith starts a cluster whose instances use senders pipeline
+// senders each; 0 sends every check on its own.
+func startClusterWith(t testing.TB, n, burst, senders int) *cluster {
 	t.Helper()
 	redisURL := os.Getenv("RL_TEST_REDIS_URL")
 	if redisURL == "" {
@@ -59,7 +67,7 @@ func startCluster(t *testing.T, n, burst int) *cluster {
 	cfg := config.Config{
 		RedisURL: redisURL, PolicyFile: c.policy, PolicyReload: 20 * time.Millisecond,
 		OnRedisFailure: config.FailClosed, Replicas: n, RedisTimeout: time.Second,
-		BreakerThreshold: 5, BreakerCooldown: time.Second,
+		BreakerThreshold: 5, BreakerCooldown: time.Second, PipelineSenders: senders,
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	for i := 0; i < n; i++ {
@@ -75,7 +83,7 @@ func startCluster(t *testing.T, n, burst int) *cluster {
 	return c
 }
 
-func (c *cluster) writePolicies(t *testing.T, burst int) {
+func (c *cluster) writePolicies(t testing.TB, burst int) {
 	t.Helper()
 	// Write and rename, so a reload never reads a half-written file.
 	tmp := c.policy + ".tmp"
@@ -87,7 +95,7 @@ func (c *cluster) writePolicies(t *testing.T, burst int) {
 	}
 }
 
-func (c *cluster) check(t *testing.T, instance int, body map[string]any) decision {
+func (c *cluster) check(t testing.TB, instance int, body map[string]any) decision {
 	t.Helper()
 	raw, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.urls[instance]+"/v1/check", bytes.NewReader(raw))
@@ -113,7 +121,7 @@ func (c *cluster) check(t *testing.T, instance int, body map[string]any) decisio
 	return d
 }
 
-func uniqueKey(t *testing.T) string {
+func uniqueKey(t testing.TB) string {
 	t.Helper()
 	var b [6]byte
 	_, _ = rand.Read(b[:])
@@ -127,40 +135,45 @@ func uniqueKey(t *testing.T) string {
 // instance ran it.
 func TestInstancesEnforceOneLimit(t *testing.T) {
 	const instances, burst, requests = 3, 25, 240
-	c := startCluster(t, instances, burst)
+	direct := startClusterWith(t, instances, burst, 0)
+	piped := startClusterWith(t, instances, burst, 2)
 
 	for _, pol := range []string{"tb", "gcra", "sw"} {
-		t.Run(pol, func(t *testing.T) {
-			key := uniqueKey(t)
-			var (
-				wg        sync.WaitGroup
-				mu        sync.Mutex
-				remaining []int64
-			)
-			for i := 0; i < requests; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					d := c.check(t, i%instances, map[string]any{"policy": pol, "key": key})
-					if d.Allowed {
-						mu.Lock()
-						remaining = append(remaining, d.Remaining)
-						mu.Unlock()
-					}
-				}()
-			}
-			wg.Wait()
+		for mode, c := range map[string]*cluster{"direct": direct, "pipelined": piped} {
+			t.Run(pol+"/"+mode, func(t *testing.T) { enforceOneLimit(t, c, pol, burst, requests) })
+		}
+	}
+}
 
-			if len(remaining) != burst {
-				t.Fatalf("%d of %d allowed across %d instances, want exactly %d", len(remaining), requests, instances, burst)
+func enforceOneLimit(t *testing.T, c *cluster, pol string, burst, requests int) {
+	key := uniqueKey(t)
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		remaining []int64
+	)
+	for i := 0; i < requests; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d := c.check(t, i%len(c.urls), map[string]any{"policy": pol, "key": key})
+			if d.Allowed {
+				mu.Lock()
+				remaining = append(remaining, d.Remaining)
+				mu.Unlock()
 			}
-			sort.Slice(remaining, func(i, j int) bool { return remaining[i] < remaining[j] })
-			for i, r := range remaining {
-				if r != int64(i) {
-					t.Fatalf("remaining counts %v, want 0..%d once each", remaining, burst-1)
-				}
-			}
-		})
+		}()
+	}
+	wg.Wait()
+
+	if len(remaining) != burst {
+		t.Fatalf("%d of %d allowed across %d instances, want exactly %d", len(remaining), requests, len(c.urls), burst)
+	}
+	sort.Slice(remaining, func(i, j int) bool { return remaining[i] < remaining[j] })
+	for i, r := range remaining {
+		if r != int64(i) {
+			t.Fatalf("remaining counts %v, want 0..%d once each", remaining, burst-1)
+		}
 	}
 }
 

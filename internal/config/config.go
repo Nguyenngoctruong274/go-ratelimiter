@@ -38,6 +38,9 @@ type Config struct {
 	RedisTimeout     time.Duration
 	BreakerThreshold int
 	BreakerCooldown  time.Duration
+	// PipelineSenders is how many pipelines of batched checks may be in
+	// flight to Redis at once; 0 sends every check on its own.
+	PipelineSenders int
 }
 
 // FailureMode is the value of RL_ON_REDIS_FAILURE.
@@ -71,6 +74,7 @@ func load(getenv func(string) string) (Config, error) {
 		RedisTimeout:     100 * time.Millisecond,
 		BreakerThreshold: 5,
 		BreakerCooldown:  5 * time.Second,
+		PipelineSenders:  4,
 	}
 
 	var errs []error
@@ -89,17 +93,20 @@ func load(getenv func(string) string) (Config, error) {
 			*dst = d
 		}
 	}
-	positiveInt := func(name string, dst *int) {
+	integer := func(name string, dst *int, allowZero bool) {
 		raw := getenv(name)
 		if raw == "" {
 			return
 		}
 		n, err := strconv.Atoi(raw)
-		if err != nil || n <= 0 {
-			errs = append(errs, fmt.Errorf("%s: must be a positive integer", name))
-			return
+		switch {
+		case err != nil || n < 0:
+			errs = append(errs, fmt.Errorf("%s: must be a non-negative integer", name))
+		case n == 0 && !allowZero:
+			errs = append(errs, fmt.Errorf("%s: must be positive", name))
+		default:
+			*dst = n
 		}
-		*dst = n
 	}
 
 	if cfg.RedisURL == "" {
@@ -138,10 +145,11 @@ func load(getenv func(string) string) (Config, error) {
 	default:
 		errs = append(errs, fmt.Errorf("RL_ON_REDIS_FAILURE: must be closed, open or local, got %s", strconv.Quote(string(cfg.OnRedisFailure))))
 	}
-	positiveInt("RL_REPLICAS", &cfg.Replicas)
+	integer("RL_REPLICAS", &cfg.Replicas, false)
 	duration("RL_REDIS_TIMEOUT", &cfg.RedisTimeout, false)
-	positiveInt("RL_BREAKER_THRESHOLD", &cfg.BreakerThreshold)
+	integer("RL_BREAKER_THRESHOLD", &cfg.BreakerThreshold, false)
 	duration("RL_BREAKER_COOLDOWN", &cfg.BreakerCooldown, false)
+	integer("RL_REDIS_PIPELINE_SENDERS", &cfg.PipelineSenders, true)
 
 	switch cfg.LogLevel {
 	case "debug", "info", "warn", "error":
