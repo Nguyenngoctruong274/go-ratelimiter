@@ -177,24 +177,39 @@ func TestScriptsMatchReference(t *testing.T) {
 		limits = append(limits, limiter.Limit{Rate: 1 + rng.Int63n(1000), Period: per, Burst: 1 + rng.Int63n(500)})
 	}
 
-	for _, alg := range algorithms {
-		t.Run(alg.name, func(t *testing.T) {
-			tested := 0
-			for li, l := range limits {
-				store := alg.new(c, testPrefix(t, c))
-				if store.check(l, 0) != nil {
-					continue // beyond what this algorithm accepts
+	for _, tr := range transports(t, c) {
+		for _, alg := range algorithms {
+			t.Run(tr.name+"/"+alg.name, func(t *testing.T) {
+				tested := 0
+				for li, l := range limits {
+					store := alg.new(tr.rdb, testPrefix(t, c))
+					if store.check(l, 0) != nil {
+						continue // beyond what this algorithm accepts
+					}
+					tested++
+					t.Run(fmt.Sprintf("%d_%s", li, strings.ReplaceAll(l.String(), " ", "_")), func(t *testing.T) {
+						replay(t, c, alg, store, l, rng)
+					})
 				}
-				tested++
-				t.Run(fmt.Sprintf("%d_%s", li, strings.ReplaceAll(l.String(), " ", "_")), func(t *testing.T) {
-					replay(t, c, alg, store, l, rng)
-				})
-			}
-			if tested < len(limits)-3 {
-				t.Fatalf("only %d of %d limits were valid for %s", tested, len(limits), alg.name)
-			}
-		})
+				if tested < len(limits)-3 {
+					t.Fatalf("only %d of %d limits were valid for %s", tested, len(limits), alg.name)
+				}
+			})
+		}
 	}
+}
+
+// transport is a way to send the scripts: straight through the client, or
+// batched by a Pipeline. Every script must behave identically on both.
+type transport struct {
+	name string
+	rdb  redis.Scripter
+}
+
+func transports(t testing.TB, c *redis.Client) []transport {
+	p := NewPipeline(c, PipelineOptions{})
+	t.Cleanup(func() { _ = p.Close() })
+	return []transport{{"direct", c}, {"pipelined", p}}
 }
 
 func replay(t *testing.T, c *redis.Client, alg algorithm, store *scripted, l limiter.Limit, rng *mrand.Rand) {
