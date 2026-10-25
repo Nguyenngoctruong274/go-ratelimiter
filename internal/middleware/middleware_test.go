@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -184,6 +186,43 @@ func TestMiddlewareLimiterFailures(t *testing.T) {
 				t.Fatal("headers sent without a decision")
 			}
 		})
+	}
+}
+
+// ctxLimiter fails the way a Redis call does when its context ends.
+type ctxLimiter struct{}
+
+func (ctxLimiter) Allow(ctx context.Context, _ string, _ limiter.Limit, _ int64) (limiter.Decision, error) {
+	<-ctx.Done()
+	return limiter.Decision{}, ctx.Err()
+}
+
+// TestMiddlewareClientGone: when the client disconnects during the check,
+// the protected handler must not run, even with FailOpen, and nothing is
+// logged as a limiter failure.
+func TestMiddlewareClientGone(t *testing.T) {
+	var logs strings.Builder
+	var served atomic.Bool
+	m, err := New(Options{
+		Limiter: ctxLimiter{}, Limit: limiter.PerSecond(1, 1), Key: byRemote, FailOpen: true,
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := m(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { served.Store(true) }))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	r := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
+	r.RemoteAddr = "a"
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	if served.Load() {
+		t.Fatal("handler ran for a client that had gone")
+	}
+	if strings.Contains(logs.String(), "level=ERROR") {
+		t.Fatalf("logged as a failure:\n%s", logs.String())
 	}
 }
 

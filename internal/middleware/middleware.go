@@ -150,6 +150,13 @@ func Enforce(res Resolver, opts EnforceOptions) func(http.Handler) http.Handler 
 					writeError(w, http.StatusBadRequest, "invalid_cost",
 						fmt.Sprintf("request cost %d exceeds the burst of %d", c.Cost, c.Limit.Burst), 0)
 					return
+				case err != nil && r.Context().Err() != nil:
+					// The client is gone; there is no one to answer and no
+					// outage to report. Do not run the handler for it either,
+					// even with FailOpen.
+					opts.Logger.DebugContext(r.Context(), "rate limit check abandoned by the client",
+						slog.String("policy", c.Policy), slog.Any("error", err))
+					return
 				case err != nil:
 					opts.Logger.ErrorContext(r.Context(), "rate limiter failed",
 						slog.String("policy", c.Policy), slog.Bool("fail_open", opts.FailOpen), slog.Any("error", err))

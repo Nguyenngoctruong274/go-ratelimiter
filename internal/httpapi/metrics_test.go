@@ -1,7 +1,11 @@
 package httpapi
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -65,6 +69,40 @@ func TestMetrics(t *testing.T) {
 	}
 	if strings.Contains(out, "attacker-chosen-name") || strings.Contains(out, "/no/such/path") {
 		t.Error("request data leaked into metric labels")
+	}
+}
+
+// ctxLimiter fails the way a Redis call does when its context ends.
+type ctxLimiter struct{}
+
+func (ctxLimiter) Allow(ctx context.Context, _ string, _ limiter.Limit, _ int64) (limiter.Decision, error) {
+	<-ctx.Done()
+	return limiter.Decision{}, fmt.Errorf("redis: %w", ctx.Err())
+}
+
+// TestCheckAbandonedByCaller: a client that disconnects mid-check is not a
+// limiter outage, so it must not count as unavailable (which alerts) nor
+// be logged as an error.
+func TestCheckAbandonedByCaller(t *testing.T) {
+	reg := metrics.NewRegistry()
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	h := NewHandler(logger, Options{Metrics: reg, Policies: policies{
+		"api/": {Name: "api", Limiter: ctxLimiter{}, Limit: limiter.PerMinute(60, 1), Cost: 1},
+	}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/check", strings.NewReader(`{"policy":"api","key":"k"}`)).WithContext(ctx)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	out := scrape(t, h)
+	if !strings.Contains(out, `ratelimit_checks_total{policy="api",result="canceled"} 1`+"\n") ||
+		strings.Contains(out, `result="unavailable"`) {
+		t.Fatalf("metrics:\n%s", out)
+	}
+	if strings.Contains(logs.String(), "level=ERROR") {
+		t.Fatalf("logged as an error:\n%s", logs.String())
 	}
 }
 

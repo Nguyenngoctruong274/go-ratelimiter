@@ -114,6 +114,15 @@ func (a *api) check(w http.ResponseWriter, r *http.Request) {
 		a.logger.ErrorContext(r.Context(), "rate limit misconfigured", slog.String("policy", p.Name), slog.Any("error", err))
 		writeError(w, http.StatusInternalServerError, "limiter_misconfigured", "rate limiter misconfigured")
 		return
+	case err != nil && r.Context().Err() != nil:
+		// The caller hung up or its deadline passed while Redis was
+		// answering. Nobody is waiting for the decision, and it says
+		// nothing about the limiter, so it must not page anyone as an
+		// outage.
+		a.checks.Inc(p.Name, "canceled")
+		a.logger.DebugContext(r.Context(), "check abandoned by the caller",
+			slog.String("policy", p.Name), slog.Any("error", err))
+		return
 	case err != nil:
 		a.logger.ErrorContext(r.Context(), "rate limiter failed",
 			slog.String("policy", p.Name), slog.Bool("fail_open", a.failOpen), slog.Any("error", err))

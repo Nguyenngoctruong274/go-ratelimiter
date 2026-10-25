@@ -59,7 +59,7 @@ func NewHandler(logger *slog.Logger, opts Options) http.Handler {
 			"HTTP request latency by method and route pattern.", metrics.FastLatencyBuckets, "method", "route"),
 		checks: reg.NewCounterVec("ratelimit_checks_total",
 			"POST /v1/check results by policy: allowed, denied, unlimited, fail_open, unavailable, "+
-				"invalid, unknown_policy, misconfigured. The policy is empty when the request named none that exists.",
+				"canceled, invalid, unknown_policy, misconfigured. The policy is empty when the request named none that exists.",
 			"policy", "result"),
 	}
 
