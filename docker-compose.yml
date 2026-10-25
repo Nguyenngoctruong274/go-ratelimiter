@@ -1,3 +1,30 @@
+# `docker compose up -d` starts only Redis, for local development and tests.
+# `docker compose --profile stack up --build` starts the whole system:
+#
+#   ratelimitd-a  http://localhost:8080   /v1/check, /metrics, /readyz
+#   ratelimitd-b  http://localhost:8081   a second instance on the same Redis
+#   prometheus    http://localhost:9090   scrapes both, loads deploy/alerts.yml
+#
+# `make load` then sends checks to both instances; together they allow one
+# limit.
+x-ratelimitd: &ratelimitd
+  profiles: ["stack"]
+  build: .
+  environment:
+    RL_REDIS_URL: redis://redis:6379/0
+    RL_LOG_LEVEL: info
+    RL_SHUTDOWN_DRAIN: 2s
+    RL_POLICY_FILE: /etc/ratelimitd/policies.json
+    RL_ON_REDIS_FAILURE: local
+    RL_REPLICAS: "2"
+  volumes:
+    - ./deploy/policies.json:/etc/ratelimitd/policies.json:ro
+  depends_on:
+    redis:
+      condition: service_healthy
+  stop_grace_period: 20s
+  restart: unless-stopped
+
 services:
   redis:
     image: redis:7.4-alpine
@@ -10,19 +37,25 @@ services:
       timeout: 2s
       retries: 15
 
-  ratelimitd:
-    profiles: ["stack"]
-    build: .
-    environment:
-      RL_REDIS_URL: redis://redis:6379/0
-      RL_LOG_LEVEL: info
-      RL_SHUTDOWN_DRAIN: 2s
-      RL_POLICY_FILE: /etc/ratelimitd/policies.json
-      RL_ON_REDIS_FAILURE: local
-    volumes:
-      - ./deploy/policies.json:/etc/ratelimitd/policies.json:ro
+  ratelimitd-a:
+    <<: *ratelimitd
     ports:
       - "8080:8080"
+
+  ratelimitd-b:
+    <<: *ratelimitd
+    ports:
+      - "8081:8080"
+
+  prometheus:
+    profiles: ["stack"]
+    image: prom/prometheus:v2.54.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
     depends_on:
-      redis:
-        condition: service_healthy
+      - ratelimitd-a
+      - ratelimitd-b

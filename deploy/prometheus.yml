@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: ratelimitd
+    static_configs:
+      - targets: ["ratelimitd-a:8080", "ratelimitd-b:8080"]
+
+rule_files:
+  - /etc/prometheus/alerts.yml

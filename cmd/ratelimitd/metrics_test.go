@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -167,4 +169,36 @@ func reportLatency(b *testing.B, lat []time.Duration) {
 	pct := func(q float64) float64 { return float64(lat[int(q*float64(len(lat)-1))].Microseconds()) }
 	b.ReportMetric(pct(0.50), "p50-µs")
 	b.ReportMetric(pct(0.99), "p99-µs")
+}
+
+// TestAlertRulesUseExportedMetrics keeps deploy/alerts.yml honest: every
+// metric an alert reads must be one the service exports, or the alert can
+// never fire and nobody would notice.
+func TestAlertRulesUseExportedMetrics(t *testing.T) {
+	rules, err := os.ReadFile("../../deploy/alerts.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := regexp.MustCompile(`\b(?:ratelimit|redis_pool)_[a-z_]+`).FindAllString(string(rules), -1)
+	if len(names) < 5 {
+		t.Fatalf("found only %v in alerts.yml", names)
+	}
+
+	c := startCluster(t, 1, 5)
+	c.check(t, 0, map[string]any{"policy": "gcra", "key": uniqueKey(t)})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, c.urls[0]+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	for _, name := range names {
+		if !regexp.MustCompile(`(?m)^` + name + `[{ ]`).Match(raw) {
+			t.Errorf("alerts.yml uses %s, which /metrics does not export", name)
+		}
+	}
 }

@@ -1,0 +1,38 @@
+groups:
+  - name: ratelimitd
+    rules:
+      - alert: RateLimiterOnFallback
+        expr: max by (algorithm) (ratelimit_breaker_state) > 0
+        for: 1m
+        annotations:
+          summary: >-
+            The Redis breaker for {{ $labels.algorithm }} is not closed: decisions come from the
+            local share (or fail) instead of the shared limit.
+      - alert: RateLimitChecksUndecided
+        expr: |
+          sum(rate(ratelimit_checks_total{result=~"unavailable|fail_open"}[5m]))
+            / sum(rate(ratelimit_checks_total[5m])) > 0.01
+        for: 5m
+        annotations:
+          summary: More than 1% of checks got no decision (503 or failed open).
+      - alert: RateLimiterRedisSlow
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(ratelimit_redis_check_duration_seconds_bucket[5m]))) > 0.025
+        for: 10m
+        annotations:
+          summary: p99 of a check on Redis is above 25ms; callers wait on every request.
+      - alert: RateLimiterRedisPoolExhausted
+        expr: rate(redis_pool_timeouts_total[5m]) > 0
+        for: 5m
+        annotations:
+          summary: Checks are timing out waiting for a Redis connection.
+      - alert: RateLimitPolicyReloadFailing
+        expr: max(ratelimit_policy_reload_failing) == 1
+        for: 5m
+        annotations:
+          summary: The policy file on disk is invalid; older rules are still enforced.
+      - alert: RatelimitdDown
+        expr: up{job="ratelimitd"} == 0
+        for: 1m
+        annotations:
+          summary: A ratelimitd instance is not being scraped.

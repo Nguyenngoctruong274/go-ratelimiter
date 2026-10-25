@@ -58,17 +58,41 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - name: Validate compose file
         run: docker compose --profile stack config -q
-      - name: Smoke test the stack
+      - name: Validate Prometheus config and alert rules
+        run: |
+          docker run --rm -v "$PWD/deploy:/etc/prometheus:ro" --entrypoint promtool \
+            prom/prometheus:v2.54.1 check config /etc/prometheus/prometheus.yml
+      - name: Start the stack
         run: |
           docker compose --profile stack up -d --build
+          for port in 8080 8081; do
+            for i in $(seq 1 30); do
+              curl -fsS "localhost:$port/readyz" && break
+              if [ "$i" = 30 ]; then docker compose --profile stack logs; exit 1; fi
+              sleep 2
+            done
+          done
+      - name: Two instances enforce one limit
+        # login allows 5 per minute: 100 checks spread over both instances
+        # must get exactly 5 grants in total.
+        run: go run ./cmd/rlload -targets http://localhost:8080,http://localhost:8081 -policy login -key ci -requests 100 -want-allowed 5
+      - name: Prometheus scrapes both instances
+        run: |
           for i in $(seq 1 30); do
-            curl -fsS localhost:8080/readyz && exit 0
+            up=$(curl -fsS 'localhost:9090/api/v1/query?query=count(up%7Bjob%3D%22ratelimitd%22%7D%3D%3D1)' \
+              | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(r[0]["value"][1] if r else 0)') || up=0
+            [ "$up" = 2 ] && exit 0
             sleep 2
           done
-          docker compose --profile stack logs
-          exit 1
+          echo "instances up: $up, want 2"; exit 1
+      - name: Logs on failure
+        if: failure()
+        run: docker compose --profile stack logs
       - name: Tear down
         if: always()
         run: docker compose --profile stack down -v

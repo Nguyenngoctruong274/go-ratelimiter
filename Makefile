@@ -59,8 +59,12 @@ up: ## Start local dependencies (Redis)
 	docker compose up -d
 
 .PHONY: stack
-stack: ## Run ratelimitd and Redis in Docker
+stack: ## Run two ratelimitd instances, Redis and Prometheus in Docker
 	docker compose --profile stack up --build
+
+.PHONY: load
+load: ## Send 100 login checks to both stack instances; together they allow 5
+	go run ./cmd/rlload -targets http://localhost:8080,http://localhost:8081 -policy login -key demo-$$(date +%s) -requests 100 -want-allowed 5
 
 .PHONY: down
 down: ## Stop everything
