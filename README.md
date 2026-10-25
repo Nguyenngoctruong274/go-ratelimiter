@@ -41,16 +41,17 @@ flowchart LR
     L --> P[policy<br/>rules, tiers, hot reload]
     L --> FO[failover<br/>timeout + circuit breaker]
     FO --> RS[redisstore<br/>Lua: token bucket / sliding window / GCRA]
-    RS --> R[(Redis)]
+    RS --> PL[Pipeline<br/>batches concurrent checks] --> R[(Redis)]
     FO -. Redis down .-> FB[local share<br/>in memory]
+    API -. GET /metrics .-> M[Prometheus]
 ```
 
 | Package | Responsibility |
 |---|---|
 | `cmd/ratelimitd` | Service wiring (Redis, failover, policies), graceful shutdown |
 | `internal/config` | Environment configuration with validation |
-| `internal/httpapi` | Probes and `POST /v1/check` |
-| `internal/redisstore` | Redis connection; token bucket, GCRA and sliding window as atomic Lua scripts sharing state across instances |
+| `internal/httpapi` | Probes, `POST /v1/check`, `GET /metrics` |
+| `internal/redisstore` | Redis connection; token bucket, GCRA and sliding window as atomic Lua scripts sharing state across instances; `Pipeline` batches concurrent checks into one round trip |
 | `internal/limiter` | `Limit`, `Decision`, the `Limiter` interface, `Clock` |
 | `internal/algo` | Token bucket, GCRA and sliding window as pure functions of (state, limit, now, cost): the reference for the Lua scripts |
 | `internal/memory` | Single-process token-bucket limiter: Redis fallback, or enough for one replica |
@@ -58,6 +59,7 @@ flowchart LR
 | `internal/policy` | JSON rules: route matching, keys, algorithms, tiers, costs; validated and hot-reloaded |
 | `internal/breaker` | Circuit breaker: consecutive-failure threshold, cooldown, one half-open probe |
 | `internal/failover` | Wraps the Redis limiter with a timeout and a breaker; local fallback or `ErrUnavailable` during an outage |
+| `internal/metrics` | Dependency-free Prometheus text exposition: counters, gauges, histograms |
 
 ## Token bucket
 
@@ -260,7 +262,8 @@ a wait, ignoring the clock lag, a `>` for a `>=`) fails the reference test.
 All three cost the same: one round trip and about 80 bytes per active key.
 Against a local Redis 7 on an Apple M2 laptop, one `Allow` takes about
 164 µs serially and 46 µs per call with 8 goroutines, for every algorithm,
-which is almost all network round trip. Day 9 works on fewer round trips.
+which is almost all network round trip. [Pipelining](#pipelining) shares
+those round trips between concurrent checks.
 
 ## HTTP middleware
 
@@ -515,6 +518,99 @@ same config:
 | `TestInstancesShareStateSequentially` | Alternating instances continue one count; an unlimited tier is never counted |
 | `TestPolicyReloadReachesEveryInstance` | Editing the shared file changes the limit on every instance |
 
+## Pipelining
+
+A check is microseconds of Lua and a full network round trip. Under load,
+a service sends many checks at once, each on its own connection, so the
+time goes to round trips and system calls on both ends. `redisstore.Pipeline`
+sends them together:
+
+```go
+p := redisstore.NewPipeline(rdb, redisstore.PipelineOptions{}) // 4 senders, ≤128 per batch
+defer p.Close()
+lim := redisstore.NewGCRA(p, "") // any limiter: Pipeline is a redis.Scripter
+```
+
+- **No linger, no timer.** A check is handed straight to an idle sender, so
+  when the service is quiet it is sent at once, alone, and costs exactly
+  what a direct call does (`TestPipelineIdleCheckIsOneRoundTrip`). Checks
+  that arrive while every sender is busy wait for the next free one, which
+  takes all of them as one pipeline. Batches grow with load by themselves.
+- **Still one atomic script per check.** Pipelining changes how commands
+  travel, not how Redis runs them. `TestScriptsMatchReference` replays every
+  timeline both directly and through a pipeline and requires the same
+  decisions and stored state; 300 goroutines on 3 pipelined instances
+  still grant exactly the burst.
+- **Failures stay per check.** When the round trip fails, every check in it
+  gets the error, never a silent allow. A caller whose context ends gets
+  its own error at once, even though its batch is still waiting on Redis.
+  An empty script cache (`NOSCRIPT` after a restart) is recovered check by
+  check through `EVAL`.
+- **What it costs.** A check that arrives while its batch is being
+  assembled waits for the batch ahead of it. In the numbers below that
+  wait is smaller than the queueing it removes.
+
+`ratelimitd` pipelines by default (`RL_REDIS_PIPELINE_SENDERS=4`; `0`
+turns it off). `make bench-redis` measures both modes, with GCRA over 1,024
+keys, against a local Redis 8.2 on an Apple M2 (8 cores):
+
+| Redis check, concurrent callers | direct checks/s | pipelined checks/s | direct p99 | pipelined p99 | checks per round trip |
+|---|---|---|---|---|---|
+| 1 | 5,000 | 5,400 | 662 µs | 559 µs | 1.0 |
+| 16 | 27,200 | 29,400 | 1.36 ms | 1.21 ms | 2.9 |
+| 64 | 40,700 | 58,200 | 4.33 ms | 2.05 ms | 11 |
+| 256 | 45,300 | **96,100** | 10.6 ms | **5.66 ms** | 39 |
+
+Direct calls stop scaling at about 45,000 checks/s; pipelined ones keep
+going, and at 256 callers deliver 2.1× the throughput at half the p99.
+Through the whole service (`BenchmarkServiceCheck`: HTTP, JSON, policy
+lookup, failover and Redis, with the load generator, the service and Redis
+sharing the same 8 cores) the gain is smaller, because the CPU becomes the
+limit before the network does:
+
+| `POST /v1/check`, concurrent callers | direct checks/s | pipelined checks/s | direct p99 | pipelined p99 |
+|---|---|---|---|---|
+| 16 | 21,800 | 24,500 | 1.48 ms | 1.13 ms |
+| 128 | 38,500 | **50,800** | 7.0 ms | **5.5 ms** |
+
+With Redis across a real network the round trip is longer, so the share
+of time pipelining saves is larger, not smaller.
+
+## Metrics
+
+`GET /metrics` serves Prometheus text format, written without a client
+library ([`internal/metrics`](internal/metrics/metrics.go)). Labels are
+never taken from request data: an unknown policy name or a random URL path
+cannot create a time series.
+
+| Metric | Type | Labels | Question it answers |
+|---|---|---|---|
+| `ratelimit_checks_total` | counter | `policy`, `result` | How many checks each policy allows, denies, or cannot decide (`allowed`, `denied`, `unlimited`, `fail_open`, `unavailable`, `invalid`, `unknown_policy`, `misconfigured`) |
+| `ratelimit_redis_check_duration_seconds` | histogram | `algorithm` | How long a check takes on Redis, pipeline wait included |
+| `ratelimit_redis_errors_total` | counter | `algorithm` | How often Redis fails or times out |
+| `ratelimit_breaker_state` | gauge | `algorithm` | Is the breaker closed (0), open (1) or half-open (2)? |
+| `ratelimit_breaker_transitions_total` | counter | `algorithm`, `to` | How often it trips and recovers |
+| `ratelimit_redis_round_trips_total`, `ratelimit_redis_pipelined_checks_total` | counter | | Checks per round trip (the ratio) |
+| `ratelimit_policy_reloads_applied_total`, `ratelimit_policy_reloads_rejected_total` | counter | | Policy file reloads |
+| `ratelimit_policy_reload_failing` | gauge | | Is the file on disk invalid, with older rules still enforced? |
+| `redis_pool_connections`, `redis_pool_idle_connections`, `redis_pool_timeouts_total` | gauge, counter | | Is the connection pool exhausted? |
+| `http_requests_total`, `http_request_duration_seconds` | counter, histogram | `method`, `route`, `status` | Traffic, errors and latency per route |
+| `go_goroutines`, `go_heap_inuse_bytes`, `go_gc_cycles_total`, `process_uptime_seconds` | | | Leaks, memory, restarts |
+
+Alerts worth having:
+
+```promql
+# Decisions are coming from the fallback (or failing) instead of Redis.
+max by (algorithm) (ratelimit_breaker_state) > 0
+# A share of checks cannot be decided at all.
+sum(rate(ratelimit_checks_total{result=~"unavailable|fail_open"}[5m]))
+  / sum(rate(ratelimit_checks_total[5m])) > 0.01
+# Redis is getting slow for its callers.
+histogram_quantile(0.99, sum by (le) (rate(ratelimit_redis_check_duration_seconds_bucket[5m]))) > 0.025
+# Someone shipped an invalid policy file; the old rules are still enforced.
+max(ratelimit_policy_reload_failing) == 1
+```
+
 ## Quick start
 
 ```bash
@@ -523,7 +619,9 @@ make run         # ratelimitd on :8080 with deploy/policies.json
 curl localhost:8080/healthz   # {"status":"ok"}
 curl -XPOST localhost:8080/v1/check -d '{"policy":"api","key":"demo"}'
 curl localhost:8080/readyz    # {"status":"ready"}; 503 if Redis is down in closed mode
+curl localhost:8080/metrics   # Prometheus metrics
 make test-redis  # unit tests + tests against the real Redis
+make bench-redis # checks/s and p99, direct vs pipelined
 ```
 
 Or run everything in containers: `make stack`.
@@ -544,6 +642,7 @@ Or run everything in containers: `make stack`.
 | `RL_REDIS_TIMEOUT` | `100ms` | Longest a check waits for Redis before it counts as a failure |
 | `RL_BREAKER_THRESHOLD` | `5` | Consecutive Redis failures that open the circuit breaker |
 | `RL_BREAKER_COOLDOWN` | `5s` | How long the breaker stays open before probing Redis |
+| `RL_REDIS_PIPELINE_SENDERS` | `4` | Pipelines of batched checks in flight to Redis at once; `0` sends every check on its own |
 
 Invalid configuration is reported all at once at startup. Redis timeouts are
 deliberately short (dial 2s, read/write 500ms): a limiter sits on the hot
@@ -555,8 +654,10 @@ path of its callers, so a slow Redis must become a fast error.
   restart every pod.
 - `GET /readyz`: readiness. Returns 503 while draining, and pings Redis
   when `RL_ON_REDIS_FAILURE=closed`.
+- `GET /metrics`: Prometheus metrics, see [Metrics](#metrics).
 - On `SIGTERM`: readiness turns 503, the service waits `RL_SHUTDOWN_DRAIN`,
-  then shuts the HTTP server down within `RL_SHUTDOWN_TIMEOUT`.
+  then shuts the HTTP server down within `RL_SHUTDOWN_TIMEOUT`, and only
+  then stops the pipeline and closes Redis, so in-flight checks finish.
 
 ## Roadmap
 
@@ -568,7 +669,7 @@ path of its callers, so a slow Redis must become a fast error.
 - [x] **Day 6**: Policy engine: multiple rules, tiers, file-based config with hot reload
 - [x] **Day 7**: Failure handling: fail-open / fail-closed, circuit breaker, local fallback
 - [x] **Day 8**: Service mode: `POST /v1/check`; multi-instance integration tests on shared Redis
-- [ ] **Day 9**: Metrics, benchmarks (checks/s, p99), fewer round trips with pipelining
+- [x] **Day 9**: Metrics, benchmarks (checks/s, p99), fewer round trips with pipelining
 - [ ] **Day 10**: Final README, design decisions, v1.0.0
 
 ## Notes
