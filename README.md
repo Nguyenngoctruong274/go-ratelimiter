@@ -10,7 +10,9 @@ Redis, and each check is one atomic Lua script, so ten replicas behind a load
 balancer enforce **one** limit, not ten. It can be used as a Go library, as
 `net/http` middleware, or as a standalone service that other systems call.
 
-> 🚧 Built in public as a 10-day series. See the [roadmap](#roadmap) for progress.
+Built in public as a 10-day series ([roadmap](#roadmap)); **v1.0.0** is the
+finished result. Every claim below is backed by a test or a benchmark in
+this repository.
 
 ## Why
 
@@ -48,7 +50,8 @@ flowchart LR
 
 | Package | Responsibility |
 |---|---|
-| `cmd/ratelimitd` | Service wiring (Redis, failover, policies), graceful shutdown |
+| `cmd/ratelimitd` | Service wiring (Redis, pipeline, failover, policies, metrics), graceful shutdown |
+| `cmd/rlload` | Load generator and end-to-end check: allowed, denied, errors, checks/s and p99 across instances |
 | `internal/config` | Environment configuration with validation |
 | `internal/httpapi` | Probes, `POST /v1/check`, `GET /metrics` |
 | `internal/redisstore` | Redis connection; token bucket, GCRA and sliding window as atomic Lua scripts sharing state across instances; `Pipeline` batches concurrent checks into one round trip |
@@ -60,6 +63,40 @@ flowchart LR
 | `internal/breaker` | Circuit breaker: consecutive-failure threshold, cooldown, one half-open probe |
 | `internal/failover` | Wraps the Redis limiter with a timeout and a breaker; local fallback or `ErrUnavailable` during an outage |
 | `internal/metrics` | Dependency-free Prometheus text exposition: counters, gauges, histograms |
+
+## Quick start
+
+Library or service, the limiter needs only a Redis.
+
+```bash
+make up          # Redis in Docker
+make run         # ratelimitd on :8080 with deploy/policies.json
+curl -XPOST localhost:8080/v1/check -d '{"policy":"api","key":"demo"}'
+curl localhost:8080/metrics   # Prometheus metrics
+make test-redis  # unit tests + tests against the real Redis
+make bench-redis # checks/s and p99, direct vs pipelined
+```
+
+The whole system in containers, two instances sharing one Redis, with
+Prometheus scraping both and [alert rules](deploy/alerts.yml) loaded:
+
+```bash
+make stack       # ratelimitd on :8080 and :8081, Prometheus on :9090
+make load        # 100 login checks over both instances
+```
+
+```text
+checks 100 in 27ms (3712/s): allowed 5, denied 95, errors 0
+latency p50 1.3ms, p99 21.4ms
+allowed by http://localhost:8080: 1
+allowed by http://localhost:8081: 4
+```
+
+`login` allows 5 per minute, and the two instances together allow exactly
+5, however the checks are spread. [`cmd/rlload`](cmd/rlload) is a small
+load generator for any deployment: `-want-allowed N` makes it exit non-zero
+unless exactly N checks were allowed, and CI runs it against the Docker
+stack on every push.
 
 ## Token bucket
 
@@ -585,7 +622,7 @@ cannot create a time series.
 
 | Metric | Type | Labels | Question it answers |
 |---|---|---|---|
-| `ratelimit_checks_total` | counter | `policy`, `result` | How many checks each policy allows, denies, or cannot decide (`allowed`, `denied`, `unlimited`, `fail_open`, `unavailable`, `invalid`, `unknown_policy`, `misconfigured`) |
+| `ratelimit_checks_total` | counter | `policy`, `result` | How many checks each policy allows, denies, or cannot decide (`allowed`, `denied`, `unlimited`, `fail_open`, `unavailable`, `canceled`, `invalid`, `unknown_policy`, `misconfigured`) |
 | `ratelimit_redis_check_duration_seconds` | histogram | `algorithm` | How long a check takes on Redis, pipeline wait included |
 | `ratelimit_redis_errors_total` | counter | `algorithm` | How often Redis fails or times out |
 | `ratelimit_breaker_state` | gauge | `algorithm` | Is the breaker closed (0), open (1) or half-open (2)? |
@@ -597,7 +634,14 @@ cannot create a time series.
 | `http_requests_total`, `http_request_duration_seconds` | counter, histogram | `method`, `route`, `status` | Traffic, errors and latency per route |
 | `go_goroutines`, `go_heap_inuse_bytes`, `go_gc_cycles_total`, `process_uptime_seconds` | | | Leaks, memory, restarts |
 
-Alerts worth having:
+A caller that hangs up during a check is counted as `canceled`, not
+`unavailable`, and logged at debug level: it is not an outage, and should
+not page anyone. The middleware does not run the protected handler for it
+either, even with `FailOpen`.
+
+[`deploy/alerts.yml`](deploy/alerts.yml) holds the rules below (and a few
+more); `TestAlertRulesUseExportedMetrics` fails if a rule reads a metric
+the service does not export, and CI checks the file with `promtool`.
 
 ```promql
 # Decisions are coming from the fallback (or failing) instead of Redis.
@@ -610,21 +654,6 @@ histogram_quantile(0.99, sum by (le) (rate(ratelimit_redis_check_duration_second
 # Someone shipped an invalid policy file; the old rules are still enforced.
 max(ratelimit_policy_reload_failing) == 1
 ```
-
-## Quick start
-
-```bash
-make up          # Redis in Docker
-make run         # ratelimitd on :8080 with deploy/policies.json
-curl localhost:8080/healthz   # {"status":"ok"}
-curl -XPOST localhost:8080/v1/check -d '{"policy":"api","key":"demo"}'
-curl localhost:8080/readyz    # {"status":"ready"}; 503 if Redis is down in closed mode
-curl localhost:8080/metrics   # Prometheus metrics
-make test-redis  # unit tests + tests against the real Redis
-make bench-redis # checks/s and p99, direct vs pipelined
-```
-
-Or run everything in containers: `make stack`.
 
 ## Configuration
 
@@ -659,6 +688,39 @@ path of its callers, so a slow Redis must become a fast error.
   then shuts the HTTP server down within `RL_SHUTDOWN_TIMEOUT`, and only
   then stops the pipeline and closes Redis, so in-flight checks finish.
 
+## Design decisions
+
+| Decision | Alternative | Why |
+|---|---|---|
+| Every check is one Lua script, with the state and the clock in Redis | `GET` + `SET` with `WATCH`, or a lock | One round trip and no retries. Redis runs a script to completion, so instances cannot race, and `TIME` gives every instance the same clock. |
+| Integer state in token-microseconds, kept below 2^53 | Floating-point tokens | Lua has only float64. Below 2^53 every value is exact, so the Lua and Go versions decide identically, and tests compare them call by call. |
+| A pure-Go reference for each algorithm, and the Lua tested against it | Testing the scripts only through their results | Random timelines with clock jumps check every decision and the stored state. Off-by-one errors and rounding bugs show up on the first run. |
+| GCRA as the recommended Redis algorithm | Token bucket everywhere | Same decisions as the token bucket, from one value, and denials do not write: an exhausted key costs Redis no writes, no replication and no AOF traffic. |
+| Sliding-window counter rather than a sliding log | Sorted set with one member per event | O(1) memory per key. Its error is measured ([accuracy comparison](#accuracy-comparison)), and the exact log is left out on purpose. |
+| State keyed by (key, limit) | One key per client | Changing a limit can never misread state kept in the old limit's units. Old state simply expires. |
+| Callers name a policy, never a limit | Limits in the request | A buggy or compromised caller can spend a client's quota but cannot raise it. |
+| Failure mode is an explicit setting: closed, open or local share | Always fail open | Each is right somewhere: login limits fail closed, API quotas often open, and a local share keeps limits roughly right through an outage. |
+| Breaker in front of Redis with one half-open probe | Timeouts only | A dead Redis costs microseconds per check instead of a timeout, and a recovering one is not hit by every instance at once. |
+| Pipelining without a linger timer | Fixed batching window | No latency is added when the service is quiet, and batches grow with load on their own. |
+| JSON policies, hot-reloaded by content hash, rejected as a whole when invalid | YAML; reloading on file modification time | No dependency the build environment could not fetch. Hashes ignore ConfigMap remounts. A typo keeps the old rules instead of removing every limit. |
+| In-repo Prometheus exposition | `prometheus/client_golang` | One dependency (`go-redis`) for the whole module; the format is small and tested byte for byte. |
+
+## Limitations and next steps
+
+- **One Redis, no sharding by key.** A Redis Cluster works with the Lua
+  scripts (one key each) and the pipeline (go-redis splits it by node), but
+  is not tested here.
+- **Local fallback assumes even traffic.** Each instance enforces
+  `1/RL_REPLICAS` of a limit during an outage. `RL_REPLICAS` is static, and
+  grants made locally are not written back to Redis.
+- **No exact "N per window" guarantee.** That needs the sliding log
+  (O(burst) memory per key), which is deliberately out of scope.
+- **HTTP only.** A gRPC interceptor would be a thin layer over
+  `middleware.Resolver`, but `google.golang.org/grpc` could not be fetched
+  in the build environment.
+- **No authentication on `ratelimitd`.** Run it on a private network or
+  behind mTLS; any caller can spend any client's quota.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with Redis, CI
@@ -670,14 +732,7 @@ path of its callers, so a slow Redis must become a fast error.
 - [x] **Day 7**: Failure handling: fail-open / fail-closed, circuit breaker, local fallback
 - [x] **Day 8**: Service mode: `POST /v1/check`; multi-instance integration tests on shared Redis
 - [x] **Day 9**: Metrics, benchmarks (checks/s, p99), fewer round trips with pipelining
-- [ ] **Day 10**: Final README, design decisions, v1.0.0
-
-## Notes
-
-- Policy files are JSON rather than YAML: the YAML libraries live on
-  `gopkg.in`, which the build environment of this project cannot fetch.
-- Only HTTP is in scope. A gRPC interceptor would need `google.golang.org/grpc`,
-  which the build environment of this project cannot fetch.
+- [x] **Day 10**: Final README, design decisions, v1.0.0
 
 ## License
 
